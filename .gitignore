@@ -1,0 +1,8 @@
+# Build products, capture smoke outputs, and model fixtures are intentionally
+# local. They can contain private meeting audio/transcripts, so never let them
+# drift toward git.
+.DS_Store
+.build/
+.capture/
+.gemini-*/
+.env*
