@@ -225,6 +225,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// rebuild only when the content signature changes — live updates without per-tick
     /// flicker. (Also refreshes the icon/title for the same suspended-mode reason.)
     func menuWillOpen(_ menu: NSMenu) {
+        // Re-derive the pending count on open; the async result republishes and the refresh
+        // timer below picks it up, so the "N pending" label is fresh without blocking the build.
+        controller.refreshPendingCount()
         lastMenuSignature = menuSignature()
         menuRefreshTimer?.invalidate()
         let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
@@ -256,11 +259,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private func menuSignature() -> String {
         [
             controller.menuStatusHeader,
+            controller.backgroundActivityText ?? "",
             controller.canStart ? "start" : "",
             controller.canStop ? "stop" : "",
             controller.attention.map(\.id).joined(separator: ","),
             (controller.currentFolder != nil || controller.lastFolder != nil) ? "reveal" : "",
             controller.isRecording ? "rec" : "",
+            "pending:\(controller.pendingTranscriptionCount)",
             // Include the bullet so the open menu rebuilds when work starts/ends, even if the
             // header text alone didn't change.
             headerBulletColor?.description ?? ""
@@ -287,6 +292,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let headerItem = header(renderedHeaderTitle(), bulletColor: headerBulletColor)
         statusHeaderItem = headerItem
         menu.addItem(headerItem)
+        // While recording, a still-running background transcription gets a dimmed, indented
+        // secondary line so it isn't hidden by the recording.
+        if let background = controller.backgroundActivityText {
+            let backgroundItem = header(background)
+            backgroundItem.indentationLevel = 1
+            menu.addItem(backgroundItem)
+        }
         menu.addItem(.separator())
 
         // Primary action: only the one that applies. ⌃⌘R mirrors the global hotkey.
@@ -301,7 +313,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 bulletColor: .systemRed
             ))
         } else if controller.canStop {
-            menu.addItem(action("Stop Recording", #selector(stopRecording), key: "r", mask: [.command, .control]))
+            // A hollow red □ fronts Stop, pairing with the filled ● on Start (record vs. stop).
+            menu.addItem(action(
+                "Stop Recording",
+                #selector(stopRecording),
+                key: "r",
+                mask: [.command, .control],
+                bulletColor: .systemRed,
+                bulletGlyph: "□"
+            ))
         }
 
         // A problem promotes its fix to first-class actions.
@@ -326,8 +346,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             menu.addItem(action(title, #selector(revealRecording)))
         }
         menu.addItem(action("Open Recordings Folder", #selector(openRecordingsFolder)))
-        if !controller.isRecording {
-            menu.addItem(action("Transcribe Pending Recordings", #selector(transcribePending)))
+        // Offer the manual retry only when something is actually waiting and nothing is already
+        // running — and say how many, so the user knows there's a backlog.
+        if !controller.isRecording, controller.processingActivity == nil, controller.pendingTranscriptionCount > 0 {
+            let count = controller.pendingTranscriptionCount
+            let title = "Transcribe \(count) Pending Recording\(count == 1 ? "" : "s")"
+            menu.addItem(action(title, #selector(transcribePending)))
         }
 
         menu.addItem(.separator())
@@ -377,17 +401,22 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// rebuilding the whole menu every second (which would flicker the rest of the items).
     private func renderedHeaderTitle() -> String {
         var title = controller.menuStatusHeader
-        if let elapsed = controller.transcribingElapsedText {
+        // Only the *primary* transcription gets the elapsed clock. While recording, the
+        // transcription is background (its own line) and the header is "Recording" — appending
+        // the clock there would read as a wrong recording time, so suppress it.
+        if controller.backgroundActivityText == nil, let elapsed = controller.transcribingElapsedText {
             title += "  \(elapsed)"
         }
         return title
     }
 
     private func updateHeaderElapsedInPlace() {
-        guard controller.processingActivity == .transcribing, let item = statusHeaderItem else { return }
-        let title = renderedHeaderTitle()
-        guard title != item.attributedTitle?.string else { return }
-        item.attributedTitle = headerAttributedTitle(title, bulletColor: headerBulletColor)
+        guard case .transcribing = controller.processingActivity, let item = statusHeaderItem else { return }
+        // Compare the fully-rendered string (bullet included) so the skip actually triggers
+        // when the second hasn't changed — otherwise this re-renders every tick.
+        let rendered = headerAttributedTitle(renderedHeaderTitle(), bulletColor: headerBulletColor)
+        guard rendered.string != item.attributedTitle?.string else { return }
+        item.attributedTitle = rendered
     }
 
     private func action(
@@ -395,16 +424,17 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         _ selector: Selector,
         key: String = "",
         mask: NSEvent.ModifierFlags = [],
-        bulletColor: NSColor? = nil
+        bulletColor: NSColor? = nil,
+        bulletGlyph: String = "●"
     ) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: selector, keyEquivalent: key)
         item.target = self
         if !key.isEmpty { item.keyEquivalentModifierMask = mask }
         if let bulletColor {
             // Unlike the header, this row is enabled, so keep the label in the normal
-            // label colour (only the ● is tinted) and let AppKit handle highlighting.
+            // label colour (only the glyph is tinted) and let AppKit handle highlighting.
             let attributed = NSMutableAttributedString(
-                string: "● ",
+                string: "\(bulletGlyph) ",
                 attributes: [.foregroundColor: bulletColor]
             )
             attributed.append(NSAttributedString(

@@ -17,6 +17,24 @@ final class MeetingStoreTests: XCTestCase {
         }
     }
 
+    func testScanSkipsFolderWithUnreadableMetadata() async throws {
+        let good = root.appendingPathComponent("2026-06-05 12-00-00 — Good")
+        let bad = root.appendingPathComponent("2026-06-05 12-01-00 — Bad")
+        try FileManager.default.createDirectory(at: bad, withIntermediateDirectories: true)
+
+        let store = MeetingStore(root: root)
+        _ = try await store.markRecordingStarted(folder: good, startedAt: Date(timeIntervalSince1970: 0))
+        // A corrupt meeting.json must not abort the whole sweep — the good folder still scans.
+        FileManager.default.createFile(
+            atPath: bad.appendingPathComponent("meeting.json").path,
+            contents: Data("{ not valid json".utf8)
+        )
+
+        let names = try await store.scan().map { $0.folder.lastPathComponent }
+        XCTAssertTrue(names.contains("2026-06-05 12-00-00 — Good"))
+        XCTAssertFalse(names.contains("2026-06-05 12-01-00 — Bad"))
+    }
+
     func testReconcileHealsStaleTranscriptionStatusWhenTranscriptExists() async throws {
         let folder = root.appendingPathComponent("2026-06-05 16-00-00 — Heal")
         let store = MeetingStore(root: root)

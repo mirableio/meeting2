@@ -28,13 +28,17 @@ enum IconState: Equatable {
 /// After-the-fact work the app is doing once a recording has stopped. Surfaced as an
 /// in-progress line in the menu and a pulsing green icon, so the user can see it's busy.
 enum ProcessingActivity: Equatable {
-    case processingAudio  // merging the two tracks into one file
-    case transcribing
+    case processingAudio(current: Int, total: Int)  // merging the two tracks into one file
+    case transcribing(current: Int, total: Int)
 
+    /// The "N of M" count is shown only when `total > 1` — a single item reads plainly, never
+    /// "1 of 1".
     var headerText: String {
         switch self {
-        case .processingAudio: return "Processing audio…"
-        case .transcribing: return "Transcribing…"
+        case let .processingAudio(current, total):
+            return total > 1 ? "Processing audio \(current) of \(total)…" : "Processing audio…"
+        case let .transcribing(current, total):
+            return total > 1 ? "Transcribing \(current) of \(total)…" : "Transcribing…"
         }
     }
 }
@@ -87,6 +91,7 @@ final class RecorderMenuController: ObservableObject {
     @Published private(set) var liveAudioWarning: LiveAudioWarning = .none
     @Published private(set) var attention: [Attention] = []
     @Published private(set) var processingActivity: ProcessingActivity?
+    @Published private(set) var pendingTranscriptionCount = 0
     @Published private(set) var successFlashActive = false
     @Published private var recordingElapsedSeconds = 0
     @Published private var isBusyStateVisible = false
@@ -214,6 +219,15 @@ final class RecorderMenuController: ObservableObject {
         }
     }
 
+    /// While a recording is live, what (if anything) is still processing in the background —
+    /// shown as a dimmed secondary menu line so an in-flight transcription isn't hidden by the
+    /// new recording. Nil when not recording or nothing is running. The icon stays the
+    /// recording dot; this is the menu's job (see plans/BACKGROUND.md, change 3).
+    var backgroundActivityText: String? {
+        guard case .recording = presentedState, let activity = processingActivity else { return nil }
+        return activity.headerText
+    }
+
     private var presentedState: RecorderMenuState {
         switch state {
         case .starting where !isBusyStateVisible,
@@ -232,7 +246,7 @@ final class RecorderMenuController: ObservableObject {
     /// transcribing. Shown inside the menu only — the menu-bar icon stays just the pulsing
     /// dot. Computed live, so the value is current whenever the menu reads it.
     var transcribingElapsedText: String? {
-        guard processingActivity == .transcribing, let start = transcribingStartedAt else { return nil }
+        guard case .transcribing = processingActivity, let start = transcribingStartedAt else { return nil }
         return Self.formatClock(max(0, Int(Date().timeIntervalSince(start))))
     }
 
@@ -267,8 +281,11 @@ final class RecorderMenuController: ObservableObject {
         micEverHadAudio = false
         systemSilentSince = nil
         endSuccessFlash()
-        processingActivity = nil
-        transcribingStartedAt = nil
+        // Do NOT clear processingActivity/transcribingStartedAt here: a transcription from a
+        // previous meeting keeps running in the background, and we now keep it visible (as a
+        // secondary menu line) instead of hiding it the moment a new recording starts. The
+        // icon is owned by recording; `iconState`/`menuStatusHeader` already mask the activity
+        // while recording. It clears itself when that work finishes (handlePostRecording*).
         clearAttention(.startFailed(""))
         clearAttention(.permissionMissing)
         beginBusyPresentation(to: .starting, delayedStatusMessage: "Starting recording...")
@@ -322,7 +339,7 @@ final class RecorderMenuController: ObservableObject {
             }
 
             do {
-                let result = try await recordingCoordinator.stopAndProcess(onPhase: phaseHandler())
+                let result = try await recordingCoordinator.stopAndProcess(onProgress: progressHandler())
                 currentFolder = nil
                 lastFolder = result.folder
                 statusMessage = "Saved \(result.folder.lastPathComponent)"
@@ -350,7 +367,7 @@ final class RecorderMenuController: ObservableObject {
 
     func transcribePendingRecordings() {
         observePostRecording(
-            recordingCoordinator.runPendingTranscriptionOnly(onPhase: phaseHandler()),
+            recordingCoordinator.runPendingTranscriptionOnly(onProgress: progressHandler()),
             silent: false
         )
     }
@@ -419,17 +436,38 @@ final class RecorderMenuController: ObservableObject {
     }
 
     private func handlePostRecordingFinished(_ result: PostRecordingPipelineResult, silent: Bool) {
-        // Any successful pipeline run means transcription is no longer outstanding.
-        clearAttention(.transcriptionFailed)
-        // The work is done either way — drop the in-progress line/icon and its clock.
+        // The work is done — drop the in-progress line/icon and its clock.
         processingActivity = nil
         transcribingStartedAt = nil
+        refreshPendingCount()
+
+        // Per-item transcription failures raise the badge; a clean run clears it. (This runs
+        // even for silent launch sweeps, so a background failure still surfaces.)
+        if result.transcriptionFailures.isEmpty {
+            clearAttention(.transcriptionFailed)
+        } else {
+            addAttention(.transcriptionFailed)
+        }
 
         guard !silent, case .idle = state else { return }
 
-        if !result.transcriptionResults.isEmpty {
-            let count = result.transcriptionResults.count
-            statusMessage = count == 1 ? "✓ Transcribed recording" : "✓ Transcribed \(count) recordings"
+        let transcribed = result.transcriptionResults.count
+        // Fold compression and transcription failures together: any failure means something
+        // didn't finish, so don't flash success — even if an *unrelated* recording transcribed
+        // fine (otherwise a just-stopped recording's compression failure is hidden behind an
+        // older one's success). The audio is safe either way and the next sweep retries.
+        let didntFinish = result.transcriptionFailures.count + result.compressionFailures.count
+        if didntFinish > 0 {
+            if transcribed > 0 {
+                statusMessage = "Transcribed \(transcribed), \(didntFinish) didn't finish — audio is safe"
+            } else {
+                statusMessage = "\(didntFinish) recording\(didntFinish == 1 ? "" : "s") didn't finish — audio is safe"
+            }
+            return
+        }
+
+        if transcribed > 0 {
+            statusMessage = transcribed == 1 ? "✓ Transcribed recording" : "✓ Transcribed \(transcribed) recordings"
             beginSuccessFlash()
             return
         }
@@ -459,25 +497,38 @@ final class RecorderMenuController: ObservableObject {
         successFlashActive = false
     }
 
-    /// A phase callback for the pipeline. Hops onto the main actor and reflects the current
-    /// stage as the in-progress activity. `[weak self]` so a finished controller doesn't keep
-    /// the closure alive.
-    private func phaseHandler() -> PostRecordingPhaseHandler {
-        { [weak self] phase in
+    /// A progress callback for the pipeline. Hops onto the main actor and reflects the current
+    /// stage + "N of M" as the in-progress activity. `[weak self]` so a finished controller
+    /// doesn't keep the closure alive.
+    private func progressHandler() -> PostRecordingProgressHandler {
+        { [weak self] progress in
             Task { @MainActor in
-                self?.applyProcessingPhase(phase)
+                self?.applyProgress(progress)
             }
         }
     }
 
-    private func applyProcessingPhase(_ phase: PostRecordingPhase) {
-        switch phase {
+    private func applyProgress(_ progress: PostRecordingProgress) {
+        switch progress.phase {
         case .compressing:
-            processingActivity = .processingAudio
+            processingActivity = .processingAudio(current: progress.current, total: progress.total)
         case .transcribing:
-            // Start (or restart) the transcription clock the moment this phase begins.
-            if processingActivity != .transcribing { transcribingStartedAt = Date() }
-            processingActivity = .transcribing
+            // Start the transcription clock once, when the stage begins — it spans the whole
+            // batch, not each item.
+            if case .transcribing = processingActivity {} else { transcribingStartedAt = Date() }
+            processingActivity = .transcribing(current: progress.current, total: progress.total)
+        }
+    }
+
+    /// Refresh the cached "N pending transcriptions" count the menu shows on its button. The
+    /// menu build is synchronous and can't await a scan, so we cache it: refreshed after each
+    /// run finishes and when the menu opens (`StatusItemController`). The async result lands on
+    /// the main actor and republishes, so an open menu picks it up on its next refresh tick.
+    func refreshPendingCount() {
+        Task { [weak self] in
+            guard let self else { return }
+            let count = await recordingCoordinator.pendingTranscriptionCount()
+            self.pendingTranscriptionCount = count
         }
     }
 
@@ -485,6 +536,7 @@ final class RecorderMenuController: ObservableObject {
         // Whatever happened, we're no longer mid-work.
         processingActivity = nil
         transcribingStartedAt = nil
+        refreshPendingCount()
 
         // A missing API key is not a failure to badge — transcription is opt-in, so we
         // never nag about it. Skip it whether the run was silent (launch) or not.
@@ -515,7 +567,7 @@ final class RecorderMenuController: ObservableObject {
             let results = try await recordingCoordinator.recoverInterruptedRecordings()
             defer {
                 observePostRecording(
-                    recordingCoordinator.runPendingPostRecording(onPhase: phaseHandler()),
+                    recordingCoordinator.runPendingPostRecording(onProgress: progressHandler()),
                     silent: silent
                 )
             }

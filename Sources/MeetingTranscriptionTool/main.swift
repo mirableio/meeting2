@@ -57,6 +57,16 @@ struct JSONTranscriptionResult: Encodable {
     let textCharacterCount: Int
 }
 
+struct JSONFailure: Encodable {
+    let folder: String
+    let error: String
+}
+
+struct JSONTranscriptionOutput: Encodable {
+    let results: [JSONTranscriptionResult]
+    let failures: [JSONFailure]
+}
+
 @main
 struct MeetingTranscriptionTool {
     static func main() async {
@@ -67,10 +77,16 @@ struct MeetingTranscriptionTool {
             let pending = try await store.scan().filter { job.needsWork($0) }
 
             guard !pending.isEmpty else {
-                if !args.json {
-                    print("No compressed recordings to transcribe under \(args.root.path)")
+                if args.json {
+                    // Same `{results, failures}` shape as the work path, so consumers don't
+                    // branch on output shape.
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                    let data = try encoder.encode(JSONTranscriptionOutput(results: [], failures: []))
+                    FileHandle.standardOutput.write(data)
+                    FileHandle.standardOutput.write(Data("\n".utf8))
                 } else {
-                    FileHandle.standardOutput.write(Data("[]\n".utf8))
+                    print("No compressed recordings to transcribe under \(args.root.path)")
                 }
                 return
             }
@@ -82,37 +98,42 @@ struct MeetingTranscriptionTool {
                 configuration.model = model
             }
             let transcriber = GeminiTranscriber(configuration: configuration)
-            var results: [MeetingTranscriptionResult] = []
-
-            for snapshot in pending {
-                results.append(try await job.perform(folder: snapshot.folder, store: store, transcriber: transcriber))
-            }
+            // Per-item isolation: a single failed recording no longer aborts the run; it's
+            // reported and we exit non-zero so scripts still notice.
+            let run = try await job.runPending(in: store, transcriber: transcriber)
 
             if args.json {
-                let json = results.map { result in
-                    JSONTranscriptionResult(
-                        folder: result.folder.path,
-                        transcriptPath: result.transcriptURL.path,
-                        markdownPath: result.markdownURL.path,
-                        provider: result.provider,
-                        model: result.model,
-                        textCharacterCount: result.textCharacterCount
-                    )
-                }
+                let output = JSONTranscriptionOutput(
+                    results: run.results.map { result in
+                        JSONTranscriptionResult(
+                            folder: result.folder.path,
+                            transcriptPath: result.transcriptURL.path,
+                            markdownPath: result.markdownURL.path,
+                            provider: result.provider,
+                            model: result.model,
+                            textCharacterCount: result.textCharacterCount
+                        )
+                    },
+                    failures: run.failures.map { JSONFailure(folder: $0.folder.path, error: $0.message) }
+                )
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-                let data = try encoder.encode(json)
+                let data = try encoder.encode(output)
                 FileHandle.standardOutput.write(data)
                 FileHandle.standardOutput.write(Data("\n".utf8))
-                return
+                exit(run.failures.isEmpty ? 0 : 1)
             }
 
-            for result in results {
+            for result in run.results {
                 print(
                     "\(result.folder.path): provider=\(result.provider) model=\(result.model) " +
                     "characters=\(result.textCharacterCount) transcript=\(result.transcriptURL.path)"
                 )
             }
+            for failure in run.failures {
+                fputs("\(failure.folder.path): FAILED \(failure.message) (audio preserved)\n", stderr)
+            }
+            if !run.failures.isEmpty { exit(1) }
         } catch {
             fputs("\(error)\n", stderr)
             fputs(Arguments.help + "\n", stderr)

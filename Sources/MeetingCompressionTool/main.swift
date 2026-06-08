@@ -42,43 +42,62 @@ struct JSONCompressionResult: Encodable {
     let metadataPath: String
 }
 
+struct JSONFailure: Encodable {
+    let folder: String
+    let error: String
+}
+
+struct JSONCompressionOutput: Encodable {
+    let results: [JSONCompressionResult]
+    let failures: [JSONFailure]
+}
+
 @main
 struct MeetingCompressionTool {
     static func main() async {
         do {
             let args = try Arguments(CommandLine.arguments)
             let store = MeetingStore(root: args.root)
-            let results = try await CompressionJob().runPending(in: store)
+            // Per-item isolation: a single bad recording no longer aborts the run; it's
+            // reported and we exit non-zero so scripts still notice.
+            let run = try await CompressionJob().runPending(in: store)
 
             if args.json {
-                let json = results.map { result in
-                    JSONCompressionResult(
-                        folder: result.folder.path,
-                        status: result.status.rawValue,
-                        didCompress: result.didCompress,
-                        audioPath: result.audioURL.path,
-                        metadataPath: result.metadataURL.path
-                    )
-                }
+                let output = JSONCompressionOutput(
+                    results: run.results.map { result in
+                        JSONCompressionResult(
+                            folder: result.folder.path,
+                            status: result.status.rawValue,
+                            didCompress: result.didCompress,
+                            audioPath: result.audioURL.path,
+                            metadataPath: result.metadataURL.path
+                        )
+                    },
+                    failures: run.failures.map { JSONFailure(folder: $0.folder.path, error: $0.message) }
+                )
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-                let data = try encoder.encode(json)
+                let data = try encoder.encode(output)
                 FileHandle.standardOutput.write(data)
                 FileHandle.standardOutput.write(Data("\n".utf8))
-                return
+                exit(run.failures.isEmpty ? 0 : 1)
             }
 
-            if results.isEmpty {
+            if run.results.isEmpty, run.failures.isEmpty {
                 print("No finalized CAF recordings to compress under \(args.root.path)")
                 return
             }
 
-            for result in results {
+            for result in run.results {
                 print(
                     "\(result.folder.path): \(result.status.rawValue) " +
                     "audio=\(result.audioURL.path) metadata=\(result.metadataURL.path)"
                 )
             }
+            for failure in run.failures {
+                fputs("\(failure.folder.path): FAILED \(failure.message) (audio preserved)\n", stderr)
+            }
+            if !run.failures.isEmpty { exit(1) }
         } catch {
             fputs("\(error)\n", stderr)
             fputs(Arguments.help + "\n", stderr)

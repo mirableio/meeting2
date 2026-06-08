@@ -27,8 +27,17 @@ public actor MeetingStore {
     /// one's state from its files. No index, no cache to invalidate — re-scanning is
     /// always correct because the disk is authoritative.
     public func scan() throws -> [MeetingSnapshot] {
-        try meetingFolders().map { folder in
-            try snapshot(folder: folder)
+        // One folder with unreadable metadata must not abort the whole sweep — skip and log
+        // it (it can't be processed without readable metadata anyway) so the reconciler keeps
+        // making progress on every other meeting. `meetingFolders()` can still throw on a
+        // genuine top-level listing failure, which is global, not one-bad-folder.
+        try meetingFolders().compactMap { folder in
+            do {
+                return try snapshot(folder: folder)
+            } catch {
+                DebugDiagnostics.log(recordingFolder: folder, "scan skipped unreadable folder error=\(error)")
+                return nil
+            }
         }
     }
 

@@ -54,11 +54,11 @@ final class RecordingCoordinator {
     }
 
     func stopAndProcess(
-        onPhase: PostRecordingPhaseHandler? = nil
+        onProgress: PostRecordingProgressHandler? = nil
     ) async throws -> RecordingCoordinatorStopResult {
         let stopped = try await recordingSession.stop()
         let task = enqueuePostRecording { pipeline in
-            try await pipeline.runAfterRecording(folder: stopped.folder, onPhase: onPhase)
+            try await pipeline.runAfterRecording(folder: stopped.folder, onProgress: onProgress)
         }
         return RecordingCoordinatorStopResult(folder: stopped.folder, postRecordingTask: task)
     }
@@ -67,19 +67,23 @@ final class RecordingCoordinator {
         try await postRecordingPipeline.recoverInterruptedRecordings()
     }
 
+    func pendingTranscriptionCount() async -> Int {
+        await postRecordingPipeline.pendingTranscriptionCount()
+    }
+
     func runPendingPostRecording(
-        onPhase: PostRecordingPhaseHandler? = nil
+        onProgress: PostRecordingProgressHandler? = nil
     ) -> Task<PostRecordingPipelineResult, Error> {
         enqueuePostRecording { pipeline in
-            try await pipeline.runPendingCompressionAndTranscription(onPhase: onPhase)
+            try await pipeline.runPendingCompressionAndTranscription(onProgress: onProgress)
         }
     }
 
     func runPendingTranscriptionOnly(
-        onPhase: PostRecordingPhaseHandler? = nil
+        onProgress: PostRecordingProgressHandler? = nil
     ) -> Task<PostRecordingPipelineResult, Error> {
         enqueuePostRecording { pipeline in
-            try await pipeline.runPendingTranscriptionOnly(onPhase: onPhase)
+            try await pipeline.runPendingTranscriptionOnly(onProgress: onProgress)
         }
     }
 

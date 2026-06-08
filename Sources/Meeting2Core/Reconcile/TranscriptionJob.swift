@@ -26,17 +26,35 @@ public struct TranscriptionJob {
             !snapshot.hasTranscript
     }
 
+    /// Process fresh transcription jobs before previously-failed ones. `scan()` is oldest-first;
+    /// this stable-partition keeps a stuck item (one that keeps failing/timing out) at the back
+    /// so it can't delay the fresh recordings ahead of it. Shared by `runPending` and
+    /// `PostRecordingPipeline` so the dev tool and the app schedule identically.
+    static func orderedFreshFirst(_ snapshots: [MeetingSnapshot]) -> [MeetingSnapshot] {
+        let fresh = snapshots.filter { $0.metadata?.jobs.transcription.status != .failed }
+        let previouslyFailed = snapshots.filter { $0.metadata?.jobs.transcription.status == .failed }
+        return fresh + previouslyFailed
+    }
+
     public func runPending(
         in store: MeetingStore,
         transcriber: any Transcriber
-    ) async throws -> [MeetingTranscriptionResult] {
+    ) async throws -> (results: [MeetingTranscriptionResult], failures: [PostRecordingFailure]) {
         var results: [MeetingTranscriptionResult] = []
+        var failures: [PostRecordingFailure] = []
 
-        for snapshot in try await store.scan() where needsWork(snapshot) {
-            results.append(try await perform(folder: snapshot.folder, store: store, transcriber: transcriber))
+        let pending = Self.orderedFreshFirst(try await store.scan().filter { needsWork($0) })
+        for snapshot in pending {
+            do {
+                results.append(try await perform(folder: snapshot.folder, store: store, transcriber: transcriber))
+            } catch {
+                // Isolate per item — one bad recording must not abort the batch (mirrors the
+                // app's PostRecordingPipeline). The audio is preserved for a later retry.
+                failures.append(PostRecordingFailure(folder: snapshot.folder, message: String(describing: error)))
+            }
         }
 
-        return results
+        return (results, failures)
     }
 
     public func perform(

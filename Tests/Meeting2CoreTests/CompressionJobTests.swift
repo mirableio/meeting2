@@ -50,7 +50,8 @@ final class CompressionJobTests: XCTestCase {
         XCTAssertEqual(metadata.tracks.system.file, "audio.m4a")
 
         let pendingAgain = try await job.runPending(in: store)
-        XCTAssertTrue(pendingAgain.isEmpty)
+        XCTAssertTrue(pendingAgain.results.isEmpty)
+        XCTAssertTrue(pendingAgain.failures.isEmpty)
     }
 
     func testCompressionHealsStaleMetadataWhenCombinedFileAlreadyExists() async throws {
@@ -84,6 +85,34 @@ final class CompressionJobTests: XCTestCase {
         let after = try AtomicJSON.read(MeetingMetadata.self, from: MeetingStore.metadataURL(in: folder))
         XCTAssertEqual(after.tracks.mic.file, "audio.m4a")
         XCTAssertEqual(after.tracks.system.file, "audio.m4a")
+    }
+
+    func testRunPendingIsolatesPerItemFailure() async throws {
+        let store = MeetingStore(root: root)
+        let job = CompressionJob()
+
+        // Good recording with valid CAFs.
+        let good = root.appendingPathComponent("2026-06-05 12-00-00 — Good")
+        _ = try await store.markRecordingStarted(folder: good, startedAt: Date(timeIntervalSince1970: 0))
+        try writeCAF(good.appendingPathComponent("mic.caf"))
+        try writeCAF(good.appendingPathComponent("system.caf"))
+        _ = try await store.finalizeCompletedRecording(folder: good, stats: nil)
+
+        // Bad recording: finalized but with an unreadable CAF, so its compression throws.
+        let bad = root.appendingPathComponent("2026-06-05 12-01-00 — Bad")
+        _ = try await store.markRecordingStarted(folder: bad, startedAt: Date(timeIntervalSince1970: 60))
+        try Data("not a real caf".utf8).write(to: bad.appendingPathComponent("mic.caf"))
+        var badMeta = try AtomicJSON.read(MeetingMetadata.self, from: MeetingStore.metadataURL(in: bad))
+        badMeta.endedAt = Date(timeIntervalSince1970: 120)
+        try AtomicJSON.write(badMeta, to: MeetingStore.metadataURL(in: bad))
+
+        let run = try await job.runPending(in: store)
+
+        // The bad item is isolated, not fatal — the good one still compressed.
+        XCTAssertEqual(run.results.count, 1)
+        XCTAssertEqual(run.failures.count, 1)
+        XCTAssertEqual(run.failures.first?.folder.lastPathComponent, "2026-06-05 12-01-00 — Bad")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: good.appendingPathComponent("audio.m4a").path))
     }
 
     func testCombinedAudioBuilderToleratesMissingTrack() throws {

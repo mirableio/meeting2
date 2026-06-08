@@ -33,14 +33,23 @@ public struct CompressionJob {
         snapshot.metadata?.endedAt != nil && (snapshot.hasMicCAF || snapshot.hasSystemCAF)
     }
 
-    public func runPending(in store: MeetingStore) async throws -> [MeetingCompressionResult] {
+    public func runPending(
+        in store: MeetingStore
+    ) async throws -> (results: [MeetingCompressionResult], failures: [PostRecordingFailure]) {
         var results: [MeetingCompressionResult] = []
+        var failures: [PostRecordingFailure] = []
 
         for snapshot in try await store.scan() where needsWork(snapshot) {
-            results.append(try await perform(folder: snapshot.folder, store: store))
+            do {
+                results.append(try await perform(folder: snapshot.folder, store: store))
+            } catch {
+                // Isolate per item — one bad recording must not abort the batch (mirrors the
+                // app's PostRecordingPipeline). The raw CAFs are preserved for a later retry.
+                failures.append(PostRecordingFailure(folder: snapshot.folder, message: String(describing: error)))
+            }
         }
 
-        return results
+        return (results, failures)
     }
 
     public func perform(folder: URL, store: MeetingStore) async throws -> MeetingCompressionResult {
