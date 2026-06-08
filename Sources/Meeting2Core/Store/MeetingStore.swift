@@ -220,6 +220,33 @@ public actor MeetingStore {
         try updateTranscriptionJob(folder: folder, status: .failed, lastError: String(describing: error))
     }
 
+    /// Renames a recording: edits only `displayName` in `meeting.json`. The folder is left
+    /// alone — its timestamp prefix is the stable identity and the slug is cosmetic — so a
+    /// rename never moves a directory whose files may be open.
+    public func setDisplayName(folder: URL, _ displayName: String) throws {
+        guard var metadata = try readMetadataIfPresent(folder: folder) else {
+            throw CaptureError.invalidState("No meeting.json to rename: \(folder.path)")
+        }
+        metadata.displayName = displayName
+        try AtomicJSON.write(metadata, to: Self.metadataURL(in: folder))
+        DebugDiagnostics.log(recordingFolder: folder, "renamed to \(displayName)")
+    }
+
+    /// Prepares a recording to be transcribed again. Deletes the transcript files **first** —
+    /// their absence is what makes `TranscriptionJob.needsWork` true — then resets the job
+    /// status to pending. Ordering is the crash contract: if it dies between the two, the
+    /// missing `transcript.json` already requeues it on the next sweep. Idempotent.
+    public func clearTranscript(folder: URL) throws {
+        let fileManager = FileManager.default
+        try? fileManager.removeItem(at: folder.appendingPathComponent("transcript.json"))
+        try? fileManager.removeItem(at: folder.appendingPathComponent("transcript.md"))
+        if var metadata = try readMetadataIfPresent(folder: folder) {
+            metadata.jobs.transcription = MeetingJob(status: .pending, lastError: nil)
+            try AtomicJSON.write(metadata, to: Self.metadataURL(in: folder))
+        }
+        DebugDiagnostics.log(recordingFolder: folder, "transcript cleared for re-transcribe")
+    }
+
     public static func metadataURL(in folder: URL) -> URL {
         folder.appendingPathComponent("meeting.json")
     }

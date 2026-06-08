@@ -35,6 +35,36 @@ final class MeetingStoreTests: XCTestCase {
         XCTAssertFalse(names.contains("2026-06-05 12-01-00 — Bad"))
     }
 
+    func testSetDisplayNameUpdatesMetadataOnly() async throws {
+        let folder = root.appendingPathComponent("2026-06-05 12-00-00 — Old Name")
+        let store = MeetingStore(root: root)
+        _ = try await store.markRecordingStarted(folder: folder, startedAt: Date(timeIntervalSince1970: 0))
+
+        try await store.setDisplayName(folder: folder, "New Name")
+
+        let metadata = try AtomicJSON.read(MeetingMetadata.self, from: MeetingStore.metadataURL(in: folder))
+        XCTAssertEqual(metadata.displayName, "New Name")
+        // The folder itself is untouched (only the JSON changed).
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.path))
+    }
+
+    func testClearTranscriptRemovesFilesAndResetsStatus() async throws {
+        let folder = root.appendingPathComponent("2026-06-05 12-00-00 — Done")
+        let store = MeetingStore(root: root)
+        _ = try await store.markRecordingStarted(folder: folder, startedAt: Date(timeIntervalSince1970: 0))
+        _ = try await store.markTranscriptionCompleted(folder: folder)
+        FileManager.default.createFile(atPath: folder.appendingPathComponent("transcript.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: folder.appendingPathComponent("transcript.md").path, contents: Data("# t".utf8))
+
+        try await store.clearTranscript(folder: folder)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("transcript.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("transcript.md").path))
+        let metadata = try AtomicJSON.read(MeetingMetadata.self, from: MeetingStore.metadataURL(in: folder))
+        XCTAssertEqual(metadata.jobs.transcription.status, .pending)
+        XCTAssertNil(metadata.jobs.transcription.lastError)
+    }
+
     func testReconcileHealsStaleTranscriptionStatusWhenTranscriptExists() async throws {
         let folder = root.appendingPathComponent("2026-06-05 16-00-00 — Heal")
         let store = MeetingStore(root: root)

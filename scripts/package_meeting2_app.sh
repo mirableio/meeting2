@@ -23,6 +23,13 @@ rm -rf "$APP"
 mkdir -p "$MACOS"
 cp "$BINARY" "$MACOS/Meeting2"
 
+# App icon: a thin white ring on a dark rounded square (matches the menu-bar circle). Regenerate
+# with `swift scripts/make_app_icon.swift Resources/AppIcon.icns` if the design changes.
+if [[ -f "$ROOT/Resources/AppIcon.icns" ]]; then
+    mkdir -p "$CONTENTS/Resources"
+    cp "$ROOT/Resources/AppIcon.icns" "$CONTENTS/Resources/AppIcon.icns"
+fi
+
 cat > "$INFO" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -32,6 +39,8 @@ cat > "$INFO" <<'PLIST'
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>Meeting2</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.mirable.Meeting2</string>
     <key>CFBundleInfoDictionaryVersion</key>

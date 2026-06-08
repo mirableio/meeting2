@@ -96,7 +96,11 @@ final class RecorderMenuController: ObservableObject {
     @Published private var recordingElapsedSeconds = 0
     @Published private var isBusyStateVisible = false
 
-    let recordingsRoot = URL(fileURLWithPath: NSString(string: "~/Recordings/Meetings").expandingTildeInPath)
+    var recordingsRoot: URL { recordingCoordinator.recordingsRoot }
+
+    /// Set by `AppDelegate` to open the recordings window from the menu — keeps the controller
+    /// from knowing about the window/library types.
+    var onOpenRecordings: (() -> Void)?
 
     private let recordingCoordinator: RecordingCoordinator
     private var hotKey: GlobalHotKey?
@@ -108,6 +112,9 @@ final class RecorderMenuController: ObservableObject {
     private var systemSilentSince: Date?
     private var busyPresentationTask: Task<Void, Never>?
     private var busyPresentationSourceState: RecorderMenuState?
+    /// Set when a quit arrives while a stop is already running, so the in-flight stop terminates on
+    /// completion instead of being killed mid-drain by an immediate second terminate.
+    private var quitRequested = false
     private var successFlashTask: Task<Void, Never>?
     private var transcribingStartedAt: Date?
     private static let successFlashSeconds: UInt64 = 1_500_000_000
@@ -116,8 +123,8 @@ final class RecorderMenuController: ObservableObject {
     private static let systemSilenceGraceSeconds: TimeInterval = 15
     private static let liveSilenceLevel: Float = 0.003
 
-    init() {
-        recordingCoordinator = RecordingCoordinator(recordingsRoot: recordingsRoot)
+    init(coordinator: RecordingCoordinator) {
+        recordingCoordinator = coordinator
 
         // Global ⌃⌘R toggles recording without opening the menu (the fast path). The
         // Carbon handler fires on the main thread, so hop straight onto the main actor.
@@ -299,6 +306,7 @@ final class RecorderMenuController: ObservableObject {
                 state = .recording
                 startElapsedClock(startedAt: Date())
                 startHealthMonitor(folder: result.folder)
+                recordingCoordinator.notifyLibraryChanged()  // new live row
             } catch {
                 endBusyPresentation()
                 stopHealthMonitor()
@@ -345,9 +353,10 @@ final class RecorderMenuController: ObservableObject {
                 statusMessage = "Saved \(result.folder.lastPathComponent)"
                 endBusyPresentation()
                 state = .idle
+                recordingCoordinator.notifyLibraryChanged()  // recording now finalized
                 observePostRecording(result.postRecordingTask, silent: false)
 
-                if terminateAfterStop {
+                if terminateAfterStop || quitRequested {
                     NSApplication.shared.terminate(nil)
                 }
             } catch {
@@ -361,6 +370,11 @@ final class RecorderMenuController: ObservableObject {
                 endBusyPresentation()
                 state = .idle
                 DebugDiagnostics.log(recordingFolder: lastFolder, "menu stop metadata failed error=\(error)")
+                // The audio is safe; if this stop was triggered by (or raced) a Quit, still
+                // terminate so the app doesn't hang waiting for a completion that already happened.
+                if terminateAfterStop || quitRequested {
+                    NSApplication.shared.terminate(nil)
+                }
             }
         }
     }
@@ -375,6 +389,24 @@ final class RecorderMenuController: ObservableObject {
     /// Retry after a transcription failure. Success clears the badge in `handlePostRecordingFinished`.
     func retryTranscription() {
         transcribePendingRecordings()
+    }
+
+    func openRecordings() {
+        onOpenRecordings?()
+    }
+
+    /// Re-transcribe a specific recording (from the library): clear its transcript, then drive
+    /// the normal observed pending sweep so the menu shows progress and failures badge as usual.
+    func reTranscribe(folder: URL) {
+        Task {
+            do {
+                try await recordingCoordinator.clearTranscriptForReTranscribe(folder: folder)
+                transcribePendingRecordings()
+            } catch {
+                lastError = String(describing: error)
+                statusMessage = "Couldn't re-transcribe — \(error)"
+            }
+        }
     }
 
     func openRecordingsFolder() {
@@ -395,13 +427,27 @@ final class RecorderMenuController: ObservableObject {
     }
 
     func quit() {
-        // Never tear the process down while a recording is live. Stop cleanly first so
-        // metadata is finalized where possible, then terminate from stop completion.
+        // Route the status-menu Quit through `applicationShouldTerminate` (→ `terminationReply`)
+        // so every quit path shares one guard.
+        NSApplication.shared.terminate(nil)
+    }
+
+    /// The single decision for every quit path (⌘Q, Dock, Apple-menu, status-menu, logout). Never
+    /// tears the process down while a recording is live *or* mid-stop:
+    ///  - live recording: kick a clean stop, terminate from its completion;
+    ///  - already stopping: remember the quit and let the in-flight stop terminate when it finishes
+    ///    (a second quit must not kill the drain — `canStop` is already false here);
+    ///  - otherwise: quit now.
+    func terminationReply() -> NSApplication.TerminateReply {
         if canStop {
             stopRecording(terminateAfterStop: true)
-        } else {
-            NSApplication.shared.terminate(nil)
+            return .terminateCancel
         }
+        if state == .stopping {
+            quitRequested = true
+            return .terminateCancel
+        }
+        return .terminateNow
     }
 
     // MARK: - Attention
@@ -440,6 +486,7 @@ final class RecorderMenuController: ObservableObject {
         processingActivity = nil
         transcribingStartedAt = nil
         refreshPendingCount()
+        recordingCoordinator.notifyLibraryChanged()
 
         // Per-item transcription failures raise the badge; a clean run clears it. (This runs
         // even for silent launch sweeps, so a background failure still surfaces.)
@@ -537,6 +584,7 @@ final class RecorderMenuController: ObservableObject {
         processingActivity = nil
         transcribingStartedAt = nil
         refreshPendingCount()
+        recordingCoordinator.notifyLibraryChanged()
 
         // A missing API key is not a failure to badge — transcription is opt-in, so we
         // never nag about it. Skip it whether the run was silent (launch) or not.
@@ -737,14 +785,82 @@ final class RecorderMenuController: ObservableObject {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var coordinator: RecordingCoordinator?
     private var controller: RecorderMenuController?
     private var statusItemController: StatusItemController?
+    private var library: RecordingsLibraryViewModel?
+    private var windowController: RecordingsWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let controller = RecorderMenuController()
+        // One shared coordinator (store + pipeline), injected into both the menu and the
+        // library — never a second pipeline/store that could diverge.
+        let coordinator = RecordingCoordinator()
+        self.coordinator = coordinator
+
+        let controller = RecorderMenuController(coordinator: coordinator)
         self.controller = controller
         self.statusItemController = StatusItemController(controller: controller)
+
+        let library = RecordingsLibraryViewModel(coordinator: coordinator)
+        // Re-transcribe routes back through the menu controller so it's the same observed
+        // sweep (menu shows progress, failures badge) as any other transcription.
+        library.reTranscribeAction = { [weak controller] folder in controller?.reTranscribe(folder: folder) }
+        self.library = library
+
+        let windowController = RecordingsWindowController(viewModel: library)
+        self.windowController = windowController
+        controller.onOpenRecordings = { [weak windowController] in windowController?.show() }
+
+        // A minimal main menu so the recordings window behaves like a normal window while it's
+        // up (⌘W to close, ⌘Q to quit, and Cut/Copy/Paste/Select-All in the rename field). It's
+        // only shown when we flip to `.regular`; harmless to set at launch.
+        NSApp.mainMenu = Self.buildMainMenu()
+
         DebugDiagnostics.log("menu app launched")
+    }
+
+    // ⌘Q / Dock Quit / Apple-menu Quit / status-menu Quit / logout all funnel through here. The
+    // controller decides: defer while a recording is live or mid-stop, otherwise quit now.
+    // (In-flight compression/transcription isn't waited on: it resumes on next launch via the
+    // reconciler, and the audio is already on disk.)
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        controller?.terminationReply() ?? .terminateNow
+    }
+
+    private static func buildMainMenu() -> NSMenu {
+        let mainMenu = NSMenu()
+
+        let appItem = NSMenuItem()
+        mainMenu.addItem(appItem)
+        let appMenu = NSMenu()
+        appItem.submenu = appMenu
+        appMenu.addItem(withTitle: "About Meeting2", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Hide Meeting2", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit Meeting2", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: "Edit")
+        editItem.submenu = editMenu
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+
+        let windowItem = NSMenuItem()
+        mainMenu.addItem(windowItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowItem.submenu = windowMenu
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        NSApp.windowsMenu = windowMenu
+
+        return mainMenu
     }
 }
 

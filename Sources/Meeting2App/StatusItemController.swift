@@ -341,6 +341,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        menu.addItem(action("Recordings…", #selector(openRecordings), key: "0", mask: [.command]))
         if controller.currentFolder != nil || controller.lastFolder != nil {
             let title = controller.isRecording ? "Reveal Current Recording" : "Reveal Last Recording"
             menu.addItem(action(title, #selector(revealRecording)))
@@ -453,6 +454,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func retryTranscription() { controller.retryTranscription() }
     @objc private func openPrivacySettings() { controller.openPrivacySettings() }
     @objc private func revealRecording() { controller.revealCurrentOrLastRecording() }
+    @objc private func openRecordings() { controller.openRecordings() }
     @objc private func openRecordingsFolder() { controller.openRecordingsFolder() }
     @objc private func transcribePending() { controller.transcribePendingRecordings() }
     @objc private func quit() { controller.quit() }
