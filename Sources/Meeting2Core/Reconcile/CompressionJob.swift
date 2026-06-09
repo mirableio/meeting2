@@ -120,7 +120,9 @@ public struct CompressionJob {
                 systemURL: systemCAF,
                 destinationURL: temporaryURL,
                 micOffsetSeconds: micOffset,
-                systemOffsetSeconds: systemOffset
+                systemOffsetSeconds: systemOffset,
+                micPeak: metadata?.tracks.mic.peak,
+                systemPeak: metadata?.tracks.system.peak
             )
             try Self.validateAudioFile(temporaryURL)
             try fileManager.moveItem(at: temporaryURL, to: audioURL)

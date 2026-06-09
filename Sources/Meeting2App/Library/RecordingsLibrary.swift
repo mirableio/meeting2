@@ -65,11 +65,15 @@ struct LibraryItem: Identifiable {
 
     private static func status(snapshot: MeetingSnapshot, isLive: Bool) -> LibraryStatus {
         if isLive { return .recording }
-        // System silence is a capture failure even if a model produced a transcript from noise:
-        // attention must win before the green "transcribed" state, or the library hides exactly
-        // the hallucinated-silence recordings this status is meant to surface. Mic-only silence
-        // stays normal: a meeting where you only listened should not show as broken.
-        if snapshot.metadata?.audioHealth.systemSilent == true {
+        // Only *total* silence is treated as broken. Mic-only recording is a normal, common case —
+        // an in-person meeting has no system (call) audio at all — so system silence on its own
+        // isn't an error here; flagging it would nag every f2f recording, and after the fact we
+        // can't tell "f2f" from "the call didn't capture". When BOTH tracks are silent, though,
+        // nothing was captured (and any transcript is hallucinated from noise), so attention wins
+        // even over the green "transcribed" state. The genuine "call didn't capture" case is caught
+        // by the live warning while recording, where the user knows whether they're on a call.
+        let health = snapshot.metadata?.audioHealth
+        if health?.micSilent == true, health?.systemSilent == true {
             return .needsAttention
         }
         if snapshot.hasTranscript { return .transcribed }
