@@ -123,6 +123,11 @@ public struct MeetingMetadata: Codable, Equatable {
     public var audioHealth: MeetingAudioHealth
     public var jobs: MeetingJobs
     public var recoveredAt: Date?
+    /// Where audio was playing when capture began (built-in speakers vs headphones vs …).
+    /// Recorded once at start; drives the route-aware combined-audio choice in compression.
+    /// Optional so older `meeting.json` files (and recovered crashes with no start record)
+    /// decode cleanly as "unknown".
+    public var outputRoute: OutputRoute?
 
     public init(
         schemaVersion: Int = 1,
@@ -134,7 +139,8 @@ public struct MeetingMetadata: Codable, Equatable {
         source: MeetingSource = MeetingSource(),
         audioHealth: MeetingAudioHealth = MeetingAudioHealth(),
         jobs: MeetingJobs = MeetingJobs(),
-        recoveredAt: Date? = nil
+        recoveredAt: Date? = nil,
+        outputRoute: OutputRoute? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.id = id
@@ -146,6 +152,7 @@ public struct MeetingMetadata: Codable, Equatable {
         self.audioHealth = audioHealth
         self.jobs = jobs
         self.recoveredAt = recoveredAt
+        self.outputRoute = outputRoute
     }
 }
 

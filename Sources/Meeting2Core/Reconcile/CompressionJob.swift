@@ -65,12 +65,14 @@ public struct CompressionJob {
             metadata: snapshot.metadata
         )
 
-        // Ordering is the crash-safety contract: write metadata pointing at audio.m4a
-        // FIRST, then delete the raw CAFs. If we die anywhere before the CAFs are gone, the
-        // folder still has CAFs, so `needsWork` re-triggers and the next pass heals it — the
-        // folder can never end up compressed-but-with-stale-metadata. (Nothing to do for a
-        // missing source: there are no CAFs and no combined file to record.)
+        // Ordering is the crash-safety contract: retain each raw track as a kept `.m4a` and
+        // write metadata FIRST, then delete the raw CAFs. If we die anywhere before the CAFs
+        // are gone, the folder still has CAFs, so `needsWork` re-triggers and the next pass
+        // heals it — the folder can never end up compressed-but-with-stale-metadata. Both
+        // the combined build and the per-track retention are idempotent, so a re-run is safe.
+        // (Nothing to do for a missing source: there are no CAFs and no combined file.)
         if status != .missingSource {
+            try retainSourceTracksAsM4A(micCAF: micCAF, systemCAF: systemCAF)
             _ = try await store.markRecordingCompressed(folder: folder)
             let fileManager = FileManager.default
             try? fileManager.removeItem(at: micCAF)
@@ -112,6 +114,12 @@ public struct CompressionJob {
         let micOffset = metadata?.tracks.mic.startOffsetSeconds ?? 0
         let systemOffset = metadata?.tracks.system.startOffsetSeconds ?? 0
 
+        // On a loudspeaker recording the mic already contains the whole conversation and the
+        // system track is just a delayed duplicate (echo), so the combined file is built
+        // from the mic alone. Anything else — headphones, external, or unknown route — keeps
+        // both tracks. The raw system audio is retained as system.m4a regardless.
+        let includeSystemTrack = metadata?.outputRoute?.isLoudspeaker != true
+
         let temporaryURL = audioURL.deletingLastPathComponent()
             .appendingPathComponent("audio.\(UUID().uuidString).m4a")
         do {
@@ -122,7 +130,8 @@ public struct CompressionJob {
                 micOffsetSeconds: micOffset,
                 systemOffsetSeconds: systemOffset,
                 micPeak: metadata?.tracks.mic.peak,
-                systemPeak: metadata?.tracks.system.peak
+                systemPeak: metadata?.tracks.system.peak,
+                includeSystemTrack: includeSystemTrack
             )
             try Self.validateAudioFile(temporaryURL)
             try fileManager.moveItem(at: temporaryURL, to: audioURL)
@@ -130,6 +139,66 @@ public struct CompressionJob {
         } catch {
             try? fileManager.removeItem(at: temporaryURL)
             throw error
+        }
+    }
+
+    /// Re-encodes each present raw CAF to a kept, compact `mic.m4a` / `system.m4a` alongside
+    /// the combined file — a safety net so the individual tracks are always recoverable even
+    /// though one of them may be dropped from the route-aware `audio.m4a`. Idempotent: an
+    /// already-encoded track is left as-is, and a missing CAF (single-track recording) is
+    /// simply skipped.
+    private func retainSourceTracksAsM4A(micCAF: URL, systemCAF: URL) throws {
+        let folder = micCAF.deletingLastPathComponent()
+        try retainTrack(caf: micCAF, m4a: folder.appendingPathComponent("mic.m4a"))
+        try retainTrack(caf: systemCAF, m4a: folder.appendingPathComponent("system.m4a"))
+    }
+
+    private func retainTrack(caf: URL, m4a: URL) throws {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: caf.path) else { return }
+        if fileManager.fileExists(atPath: m4a.path) {
+            // A prior pass already retained it; trust the validated artifact and move on.
+            if (try? Self.validateAudioFile(m4a)) != nil { return }
+            try? fileManager.removeItem(at: m4a)
+        }
+
+        let temporaryURL = m4a.deletingLastPathComponent()
+            .appendingPathComponent("\(m4a.deletingPathExtension().lastPathComponent).\(UUID().uuidString).m4a")
+        do {
+            try Self.encodeToM4A(source: caf, destination: temporaryURL)
+            try Self.validateAudioFile(temporaryURL)
+            try fileManager.moveItem(at: temporaryURL, to: m4a)
+        } catch {
+            try? fileManager.removeItem(at: temporaryURL)
+            throw error
+        }
+    }
+
+    /// Streams a mono CAF into an AAC `.m4a`, preserving its channel count and sample rate.
+    private static func encodeToM4A(source: URL, destination: URL) throws {
+        let input = try AVAudioFile(forReading: source)
+        let format = input.processingFormat
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: format.sampleRate,
+            AVNumberOfChannelsKey: Int(format.channelCount),
+            AVEncoderBitRateKey: 96_000
+        ]
+        let output = try AVAudioFile(
+            forWriting: destination,
+            settings: settings,
+            commonFormat: .pcmFormatFloat32,
+            interleaved: false
+        )
+
+        let capacity: AVAudioFrameCount = 65_536
+        while input.framePosition < input.length {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else {
+                throw CaptureError.conversionFailed("Could not allocate track-retention buffer")
+            }
+            try input.read(into: buffer)
+            if buffer.frameLength == 0 { break }
+            try output.write(from: buffer)
         }
     }
 

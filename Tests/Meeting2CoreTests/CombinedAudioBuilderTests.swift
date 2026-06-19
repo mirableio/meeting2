@@ -100,6 +100,41 @@ final class CombinedAudioBuilderTests: XCTestCase {
         XCTAssertGreaterThan(peak, 0.3, "quiet recording lost its signal (peak \(peak))")
     }
 
+    func testMicOnlyModeDuplicatesMicAndExcludesSystem() throws {
+        // Loudspeaker recording path: the system track (here a louder, distinct tone) must
+        // not appear; the mic is placed on both channels (centered mono).
+        let micURL = dir.appendingPathComponent("mic.caf")
+        let systemURL = dir.appendingPathComponent("system.caf")
+        try writeToneCAF(micURL, frames: 48_000, amplitude: 0.5)
+        try writeToneCAF(systemURL, frames: 48_000, amplitude: 0.9)
+        let destination = dir.appendingPathComponent("audio.m4a")
+
+        try CombinedAudioBuilder().build(
+            micURL: micURL,
+            systemURL: systemURL,
+            destinationURL: destination,
+            micOffsetSeconds: 0,
+            systemOffsetSeconds: 0,
+            micPeak: 0.5,
+            systemPeak: 0.9,
+            includeSystemTrack: false
+        )
+
+        let (left, right) = try decodeStereo(destination)
+        let n = min(left.count, right.count)
+        XCTAssertGreaterThan(n, 0)
+        var maxDelta: Float = 0
+        var rightPeak: Float = 0
+        for i in 0..<n {
+            maxDelta = max(maxDelta, abs(left[i] - right[i]))
+            rightPeak = max(rightPeak, abs(right[i]))
+        }
+        XCTAssertLessThan(maxDelta, 0.02, "channels differ — system leaked into the mic-only output")
+        // Right channel carries the mic (0.5), not the louder system tone (0.9).
+        XCTAssertLessThan(rightPeak, 0.7, "right channel carries the system track, not the mic")
+        XCTAssertGreaterThan(rightPeak, 0.3, "right channel lost the mic signal")
+    }
+
     // MARK: - Helpers
 
     /// Writes `frames` samples of one fixed 1-second chirp (300→3000 Hz). Two files with different

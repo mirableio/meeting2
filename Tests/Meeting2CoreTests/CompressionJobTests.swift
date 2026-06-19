@@ -45,9 +45,17 @@ final class CompressionJobTests: XCTestCase {
         XCTAssertEqual(audioFile.processingFormat.channelCount, 2)
         XCTAssertGreaterThan(audioFile.length, 0)
 
+        // Each raw track is retained as a compact per-track m4a (the precaution): the CAFs
+        // are gone but the individual tracks remain recoverable.
+        let micM4A = folder.appendingPathComponent("mic.m4a")
+        let systemM4A = folder.appendingPathComponent("system.m4a")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: micM4A.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: systemM4A.path))
+        XCTAssertGreaterThan(try AVAudioFile(forReading: micM4A).length, 0)
+
         let metadata = try AtomicJSON.read(MeetingMetadata.self, from: MeetingStore.metadataURL(in: folder))
-        XCTAssertEqual(metadata.tracks.mic.file, "audio.m4a")
-        XCTAssertEqual(metadata.tracks.system.file, "audio.m4a")
+        XCTAssertEqual(metadata.tracks.mic.file, "mic.m4a")
+        XCTAssertEqual(metadata.tracks.system.file, "system.m4a")
 
         let pendingAgain = try await job.runPending(in: store)
         XCTAssertTrue(pendingAgain.results.isEmpty)
@@ -82,9 +90,45 @@ final class CompressionJobTests: XCTestCase {
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("mic.caf").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("system.caf").path))
+        // Even on the heal path (audio.m4a already present), per-track retention still runs.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("mic.m4a").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("system.m4a").path))
         let after = try AtomicJSON.read(MeetingMetadata.self, from: MeetingStore.metadataURL(in: folder))
-        XCTAssertEqual(after.tracks.mic.file, "audio.m4a")
-        XCTAssertEqual(after.tracks.system.file, "audio.m4a")
+        XCTAssertEqual(after.tracks.mic.file, "mic.m4a")
+        XCTAssertEqual(after.tracks.system.file, "system.m4a")
+    }
+
+    func testLoudspeakerRecordingBuildsMicOnlyCombinedFileButKeepsSystemTrack() async throws {
+        // A recording made on the built-in speakers: the combined audio.m4a must be built
+        // from the mic alone (no system channel, so no echo), while the raw system audio is
+        // still retained separately as system.m4a.
+        let folder = root.appendingPathComponent("2026-06-09 14-00-00 — Loudspeaker")
+        let store = MeetingStore(root: root)
+        let job = CompressionJob()
+
+        _ = try await store.markRecordingStarted(
+            folder: folder,
+            startedAt: Date(timeIntervalSince1970: 0),
+            outputRoute: OutputRoute(transport: "BuiltIn", isLoudspeaker: true)
+        )
+        // Mic and system carry clearly different tones so we can tell whether the system
+        // channel leaked into the combined file.
+        try writeCAF(folder.appendingPathComponent("mic.caf"), divisor: 24)
+        try writeCAF(folder.appendingPathComponent("system.caf"), divisor: 7)
+        _ = try await store.finalizeCompletedRecording(folder: folder, stats: nil)
+
+        let result = try await job.perform(folder: folder, store: store)
+        XCTAssertEqual(result.status, .compressed)
+
+        // system.m4a is preserved (precaution); audio.m4a is the mic on both channels.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("system.m4a").path))
+        let (left, right) = try decodeStereo(folder.appendingPathComponent("audio.m4a"))
+        let n = min(left.count, right.count)
+        XCTAssertGreaterThan(n, 0)
+        // Mic-on-both-channels ⇒ the two channels are identical (centered mono).
+        var maxDelta: Float = 0
+        for i in 0..<n { maxDelta = max(maxDelta, abs(left[i] - right[i])) }
+        XCTAssertLessThan(maxDelta, 0.02, "mic-only output channels differ (system leaked?)")
     }
 
     func testRunPendingIsolatesPerItemFailure() async throws {
@@ -150,7 +194,7 @@ final class CompressionJobTests: XCTestCase {
         )
     }
 
-    private func writeCAF(_ url: URL) throws {
+    private func writeCAF(_ url: URL, divisor: Float = 24) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let format = AudioFormat.pcmFormat
         let file = try AVAudioFile(
@@ -169,9 +213,25 @@ final class CompressionJobTests: XCTestCase {
 
         buffer.frameLength = frameCount
         for frame in 0..<Int(frameCount) {
-            channel[frame] = sin(Float(frame) / 24)
+            channel[frame] = sin(Float(frame) / divisor)
         }
 
         try file.write(from: buffer)
+    }
+
+    private func decodeStereo(_ url: URL) throws -> ([Float], [Float]) {
+        let file = try AVAudioFile(forReading: url)
+        XCTAssertEqual(file.processingFormat.channelCount, 2)
+        guard let buffer = AVAudioPCMBuffer(
+            pcmFormat: file.processingFormat,
+            frameCapacity: AVAudioFrameCount(file.length)
+        ) else {
+            throw CaptureError.conversionFailed("decode buffer")
+        }
+        try file.read(into: buffer)
+        let n = Int(buffer.frameLength)
+        let left = Array(UnsafeBufferPointer(start: buffer.floatChannelData![0], count: n))
+        let right = Array(UnsafeBufferPointer(start: buffer.floatChannelData![1], count: n))
+        return (left, right)
     }
 }

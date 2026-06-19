@@ -49,7 +49,11 @@ final class RecordingSessionController {
         DebugDiagnostics.log(recordingFolder: folder, "session start requested")
 
         do {
-            _ = try await store.markRecordingStarted(folder: folder, startedAt: now)
+            // Probe the output route now, before the tap exists, so we record where audio
+            // was actually playing (built-in speakers vs headphones). Compression uses this
+            // to decide whether the mic alone already holds the whole conversation.
+            let outputRoute = OutputRouteProbe.current()
+            _ = try await store.markRecordingStarted(folder: folder, startedAt: now, outputRoute: outputRoute)
             recorder = try await startRecorderOffMainActor(folder: folder)
             return RecordingSessionStartResult(folder: folder)
         } catch {

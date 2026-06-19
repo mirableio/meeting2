@@ -26,6 +26,24 @@ enum AudioObjectReader {
         return value
     }
 
+    static func readUInt32(
+        _ objectID: AudioObjectID,
+        selector: AudioObjectPropertySelector
+    ) throws -> UInt32 {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        try CaptureError.check(
+            AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value),
+            "AudioObjectGetPropertyData(UInt32 \(selector))"
+        )
+        return value
+    }
+
     static func readStreamDescription(
         _ objectID: AudioObjectID,
         selector: AudioObjectPropertySelector

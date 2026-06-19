@@ -123,7 +123,11 @@ struct CaptureHarness {
             // M2 starts metadata before capture starts. This is intentionally one
             // atomic JSON write outside the sample path: if the process dies, launch
             // recovery has a durable folder identity and an `endedAt: null` marker.
-            _ = try await store.markRecordingStarted(folder: folder, startedAt: Date())
+            _ = try await store.markRecordingStarted(
+                folder: folder,
+                startedAt: Date(),
+                outputRoute: OutputRouteProbe.current()
+            )
 
             let recorder = DualTrackRecorder(folder: folder)
             try recorder.start()

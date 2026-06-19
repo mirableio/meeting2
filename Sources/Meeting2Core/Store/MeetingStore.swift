@@ -49,7 +49,11 @@ public actor MeetingStore {
     /// If a folder is re-used, we keep its identity (`id`, `displayName`) but reset the
     /// per-recording fields — tracks, audio health, and job state all describe *this*
     /// take, so stale values from a previous one would be misleading.
-    public func markRecordingStarted(folder: URL, startedAt: Date = Date()) throws -> MeetingMetadata {
+    public func markRecordingStarted(
+        folder: URL,
+        startedAt: Date = Date(),
+        outputRoute: OutputRoute? = nil
+    ) throws -> MeetingMetadata {
         let metadataURL = Self.metadataURL(in: folder)
         let existing = FileManager.default.fileExists(atPath: metadataURL.path)
             ? try AtomicJSON.read(MeetingMetadata.self, from: metadataURL)
@@ -66,6 +70,10 @@ public actor MeetingStore {
         metadata.tracks = MeetingTracks()
         metadata.audioHealth = MeetingAudioHealth()
         metadata.jobs = MeetingJobs()
+        // This take's route, captured before the tap is created. Finalize starts from this
+        // metadata and never rewrites the field, so it survives both clean stop and crash
+        // recovery; a recovered crash with no start record stays nil (unknown).
+        metadata.outputRoute = outputRoute
 
         try AtomicJSON.write(metadata, to: metadataURL)
         DebugDiagnostics.log(recordingFolder: folder, "meeting metadata started id=\(metadata.id)")
@@ -196,12 +204,17 @@ public actor MeetingStore {
                 audioURLs: [audioURL]
             ) ?? now
         }
-        // The two raw tracks now live as the left/right channels of one file. Repoint both
-        // channel records at it; their capture stats (alignment, RMS, health, route
-        // changes) were measured from the CAFs at finalize and stay as the record of how
-        // the audio was captured.
-        metadata.tracks.mic.file = "audio.m4a"
-        metadata.tracks.system.file = "audio.m4a"
+        // Each raw CAF is re-encoded to a kept per-track `.m4a` (mic.m4a / system.m4a) and
+        // the CAF deleted; the combined, route-aware `audio.m4a` is the primary playable.
+        // Repoint each channel record at its retained per-track file when present, falling
+        // back to the combined file for a track we didn't retain. Capture stats (alignment,
+        // RMS, health, route changes) were measured from the CAFs at finalize and stay as
+        // the record of how the audio was captured.
+        let fileManager = FileManager.default
+        metadata.tracks.mic.file = fileManager.fileExists(atPath: folder.appendingPathComponent("mic.m4a").path)
+            ? "mic.m4a" : "audio.m4a"
+        metadata.tracks.system.file = fileManager.fileExists(atPath: folder.appendingPathComponent("system.m4a").path)
+            ? "system.m4a" : "audio.m4a"
 
         try AtomicJSON.write(metadata, to: Self.metadataURL(in: folder))
         DebugDiagnostics.log(recordingFolder: folder, "meeting metadata combined into audio.m4a")
