@@ -26,6 +26,9 @@ COMPRESSION_ROOT ?= $(RECORDING)
 TRANSCRIPTION_ROOT ?= $(RECORDING)
 TRANSCRIPTION_ENV ?= $(CURDIR)/.env
 TRANSCRIPTION_MODEL ?= $(GEMINI_MODEL)
+RECORDINGS_ROOT ?= $(HOME)/Recordings/Meetings
+TRASH_ROOT ?= $(HOME)/.Trash
+DRY_RUN ?= 0
 
 APP := .build/$(CONFIG)/CaptureHarness.app
 HARNESS := $(APP)/Contents/MacOS/CaptureHarness
@@ -36,7 +39,7 @@ RECOVERY_TOOL := .build/$(CONFIG)/MeetingRecoveryTool
 COMPRESSION_TOOL := .build/$(CONFIG)/MeetingCompressionTool
 TRANSCRIPTION_TOOL := .build/$(CONFIG)/MeetingTranscriptionTool
 
-.PHONY: build dev-package dev-package-app dev-open-app dev-audio-devices dev-smoke dev-smoke-system dev-smoke-crash dev-smoke-route dev-smoke-route-auto dev-smoke-align dev-recover dev-compress dev-combine-stereo dev-transcribe dev-transcribe-fixture dev-clean
+.PHONY: build dev-package dev-package-app dev-open-app dev-audio-devices dev-smoke dev-smoke-system dev-smoke-crash dev-smoke-route dev-smoke-route-auto dev-smoke-align dev-recover dev-compress dev-combine-stereo dev-transcribe dev-transcribe-fixture dev-clean-retained-tracks dev-clean
 
 build:
 	swift build --configuration $(CONFIG)
@@ -142,6 +145,13 @@ dev-combine-stereo:
 
 dev-transcribe-fixture:
 	STEREO_FILE="$(STEREO_FILE)" GEMINI_OUTPUT_DIR="$(GEMINI_OUTPUT_DIR)" GEMINI_MODEL="$(GEMINI_MODEL)" scripts/transcribe_gemini_fixture.sh
+
+# Retained mic/system tracks are useful while debugging capture, but once audio.m4a
+# exists they are redundant for normal library use and can dominate disk usage. Move
+# them to a timestamped Trash folder instead of deleting them so a bad cleanup can be
+# reversed manually from Finder.
+dev-clean-retained-tracks:
+	python3 scripts/clean_retained_tracks.py --root "$(RECORDINGS_ROOT)" --trash-root "$(TRASH_ROOT)" $(if $(filter 1 true yes,$(DRY_RUN)),--dry-run)
 
 dev-clean:
 	rm -rf .build .capture .gemini-*
