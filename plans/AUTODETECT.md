@@ -73,13 +73,15 @@ the external owner can disappear with **no device-level edge**. Therefore:
 2. **Notify** — a non-modal "Recording — looks like a meeting." Informational in P1; the escape
    hatch is the existing menu/status-item **Stop** (an *actionable* notification with a
    stop/discard button is extra plumbing → P2).
-3. **Watch (recording)** → poll external owners; when none remain for the grace period (~2 min,
-   to ride over brief mute/route blips), stop.
+3. **Watch (recording)** → poll external owners; when none remain for the grace period (~20s, to
+   ride over brief device/route blips — *not* mutes, which don't release the mic in major apps),
+   stop. Kept short so a short meeting doesn't linger as a live recording for minutes before it's
+   evaluated and pruned.
 4. **Stop via the auto seam, not `stopAndProcess`** → finalize, then decide: if the **external
    owner was active for less than ~30s** **or** both tracks are silent, move the folder to
    **Trash**; otherwise enqueue the normal pipeline. "Short" is measured on *owner-active* time
    (start → owner left), **not** the recording's wall-clock duration — the file also contains the
-   ~2 min stop grace, so a 5-second grab is a ~125-second file and would survive a wall-clock test.
+   ~20s stop grace, so a 5-second grab is a ~25-second file whose *meeting* length is only 5s.
    **On uncertainty, keep.** The both-silent check needs a finalized snapshot; if it's unreadable,
    enqueue (or leave for recovery) — **never Trash on uncertainty**.
 
@@ -121,6 +123,28 @@ custom queue needed (`INIT.md` §6.2). **User-initiated delete already trashes t
 Owner-suppression also keeps the Trash from filling with dictation clips, since those are
 filtered before they're ever recorded.
 
+## "Forgot to stop" supervision (all recordings)
+
+Separate from auto-*start*, this guards against a recording left running — and applies to **every**
+recording, manual or auto, regardless of the opt-in. It lives in the controller's recording-time
+health monitor (which already samples RMS every ~2s), so it needs no new lifecycle:
+
+- **Call-owner-gone nudge** — if an external mic owner (a conferencing app) was present and then
+  releases the mic for ~3s, notify once ("the call ended, still recording"). Informational only —
+  it does **not** stop (a manual recording may be intentional). Only fires when there *was* an
+  owner, so mic-only/f2f recordings never get a spurious nudge. (Uses an on-demand
+  `MicOwnerMonitor` read, minus the shared `nonMeetingOwners` denylist so always-on speech services
+  don't count as "the call".)
+- **15-min both-silent stop** — both channels quiet (recent loudness) for 15 continuous minutes →
+  stop + notify. Any real sound on either channel resets the timer, so it needs a genuinely silent
+  stretch. The take is long, so it's kept and transcribed (the ~15-min silent tail is kept for now).
+- **3h hard cap** — a backstop for constant low-level noise that never trips the silence rule:
+  stop + notify at three hours.
+
+For an auto recording the nudge fires (~3s) *and* the auto-stop still runs (~20s grace) — the nudge
+is just an earlier heads-up. Notifications are best-effort (real `.app` + permission); the menu Stop
+is always the fallback.
+
 ## What we deliberately reject
 
 - **Auto-detecting f2f** — impossible without holding the mic open continuously (privacy cost).
@@ -150,7 +174,7 @@ filtered before they're ever recorded.
   poll-while-recording → stop on owner-gone grace → keep/prune, keep-on-uncertainty). Seams: add
   `startRecording(source:)` / `stopAutoRecording()` to the controller (optional rename to
   `RecordingController`); coordinator `start(source:)` and `stopAutoRecording`. Opt-in toggle + **informational**
-  notification + hardcoded constants (denylist, ~30s threshold, ~2 min grace) + logs.
+  notification + hardcoded constants (denylist, ~30s threshold, ~20s grace) + logs.
 - **P2 — Refinement.** Actionable notification (stop/discard button); tune the denylist from real
   usage; make threshold/grace/denylist editable; add the optional output-active signal for
   listen-only webinars.
@@ -238,7 +262,9 @@ pipeline all behave exactly as for a manual start.
 
 ## Open questions
 
-- **Threshold / grace** — ~30s prune, ~2 min stop grace (per `INIT.md`); P1 constants, P2 settings.
+- **Threshold / grace** — ~30s prune, ~20s stop grace; P1 constants, P2 settings. (`INIT.md`
+  suggested ~2 min, but that made short meetings linger live for minutes before pruning and left a
+  2 min tail on kept recordings; 20s is enough for device/route blips since mutes don't release.)
 - **Poll cadence** — a few seconds is plenty; confirm it's not noticeable and survives sleep/wake.
 - **Mute/route blips** — confirm common apps keep the device open while muted (so we don't false-
   stop); the grace period is the cushion.
@@ -248,8 +274,7 @@ pipeline all behave exactly as for a manual start.
 - **Deterministic owner** — when several apps hold the mic at once, the schema stores one. Pick the
   one that *triggered* the start (or a stable sort), and log the full set; never `Set.first` (it's
   unordered).
-- **Trailing grace audio** — a *kept* recording still contains the ~2 min stop grace after the
+- **Trailing grace audio** — a *kept* recording still contains the stop grace (~20s) after the
   meeting actually ended (the file runs start → owner-left + grace). Pruning is judged on
-  owner-active time, so this doesn't affect keep/discard, but every kept auto recording is ~2 min
-  longer than the call. Acceptable for now; revisit if it's annoying (shorten the grace, or trim
-  the tail) — most conferencing apps hold the mic open while muted, so a shorter grace may be safe.
+  owner-active time, so this doesn't affect keep/discard, and ~20s of tail is minor. Trim it only
+  if it ever matters.

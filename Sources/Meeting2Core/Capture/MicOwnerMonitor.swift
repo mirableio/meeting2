@@ -13,6 +13,16 @@ import Foundation
 /// so `DeviceIsRunningSomewhere` stays true and stops edging. The listener is therefore only a
 /// wake-up for the idle path; the active recording path calls `refreshExternalOwners()` on a timer.
 public final class MicOwnerMonitor {
+    /// Mic owners that aren't meetings — always-on speech services etc. `com.apple.CoreSpeech` is
+    /// the important one: with "Hey Siri"/dictation enabled it holds the mic input *continuously*.
+    /// Best-effort and tunable; shared by auto-detect (start gate) and the "forgot to stop" nudge.
+    public static let nonMeetingOwners: Set<String> = [
+        "com.apple.CoreSpeech",    // "Hey Siri" / on-device speech & dictation (always-on mic)
+        "com.apple.assistantd",    // Siri / the assistant daemon
+        "com.apple.corespeechd",   // older speech-daemon naming, kept defensively
+        "com.apple.VoiceOver",
+    ]
+
     /// Called (on the main thread) when the input device's running state changes — "go look at the
     /// owners." Set by the owner before `start()`.
     public var onWake: (() -> Void)?

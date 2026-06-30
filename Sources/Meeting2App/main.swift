@@ -117,6 +117,14 @@ final class RecorderMenuController: ObservableObject {
     private var recordingStartedAt: Date?
     private var micEverHadAudio = false
     private var systemSilentSince: Date?
+    // "Forgot to stop" supervision (all recordings): both-channel silence, the external mic-owner
+    // nudge, and the hard duration cap. `micOwnerMonitor` is used only for on-demand owner reads
+    // during recording (no listener), independent of the auto-detect subsystem.
+    private var bothSilentSince: Date?
+    private var recordingHadExternalOwner = false
+    private var externalOwnerGoneSince: Date?
+    private var ownerGoneNotified = false
+    private let micOwnerMonitor = MicOwnerMonitor()
     private var busyPresentationTask: Task<Void, Never>?
     private var busyPresentationSourceState: RecorderMenuState?
     /// Set when a quit arrives while a stop is already running, so the in-flight stop terminates on
@@ -129,6 +137,10 @@ final class RecorderMenuController: ObservableObject {
     private static let micSilenceGraceSeconds: TimeInterval = 30
     private static let systemSilenceGraceSeconds: TimeInterval = 15
     private static let liveSilenceLevel: Float = 0.003
+    // "Forgot to stop" thresholds.
+    private static let bothSilentStopSeconds: TimeInterval = 15 * 60   // both channels quiet this long → stop
+    private static let maxRecordingSeconds: TimeInterval = 3 * 60 * 60 // hard cap → stop
+    private static let ownerGoneNotifySeconds: TimeInterval = 3        // call's mic owner gone → nudge
 
     init(coordinator: RecordingCoordinator) {
         recordingCoordinator = coordinator
@@ -298,6 +310,11 @@ final class RecorderMenuController: ObservableObject {
         liveAudioWarning = .none
         micEverHadAudio = false
         systemSilentSince = nil
+        bothSilentSince = nil
+        recordingHadExternalOwner = false
+        externalOwnerGoneSince = nil
+        ownerGoneNotified = false
+        UserNotifier.requestAuthorization()  // for the "forgot to stop" nudges (idempotent)
         endSuccessFlash()
         // Do NOT clear processingActivity/transcribingStartedAt here: a transcription from a
         // previous meeting keeps running in the background, and we now keep it visible (as a
@@ -348,6 +365,16 @@ final class RecorderMenuController: ObservableObject {
             return
         }
 
+        // A recording stopped under the keep threshold is junk (an accidental or aborted start) —
+        // discard it instead of keeping and transcribing it. Quit is excluded (`terminateAfterStop`)
+        // so quitting never throws a recording away.
+        if !terminateAfterStop,
+           let started = recordingStartedAt,
+           Date().timeIntervalSince(started) < RecordingCoordinator.minimumKeepSeconds {
+            discardShortRecording()
+            return
+        }
+
         let folder = currentFolder
         stopHealthMonitor()
         stopElapsedClock()
@@ -389,6 +416,34 @@ final class RecorderMenuController: ObservableObject {
                     NSApplication.shared.terminate(nil)
                 }
             }
+        }
+    }
+
+    /// Stop and throw away a too-short recording (same UI teardown as a normal stop). Used for both
+    /// manual stops under the threshold and — via the same coordinator path — keeps the "discarded"
+    /// wording consistent. The folder goes to the Trash, so it's recoverable.
+    private func discardShortRecording() {
+        stopHealthMonitor()
+        stopElapsedClock()
+        liveAudioWarning = .none
+        beginBusyPresentation(to: .stopping, delayedStatusMessage: "Stopping recording...")
+
+        Task {
+            do {
+                try await recordingCoordinator.stopAndDiscard()
+                currentFolder = nil
+                statusMessage = "Discarded a short recording"
+            } catch {
+                // Stopped, but the Trash move failed — it's still on disk. Report honestly rather
+                // than claiming it was discarded; the user can delete it from the library.
+                currentFolder = nil
+                lastFolder = recordingCoordinator.lastFolder
+                lastError = String(describing: error)
+                statusMessage = "Couldn't discard the recording"
+                DebugDiagnostics.log("discard short recording failed error=\(error)")
+            }
+            endBusyPresentation()
+            state = .idle
         }
     }
 
@@ -739,6 +794,8 @@ final class RecorderMenuController: ObservableObject {
 
             while !Task.isCancelled {
                 self?.checkLiveAudioHealth(folder: folder)
+                self?.checkRecordingLimits(folder: folder)        // 15-min silence stop + 3h cap
+                await self?.checkCallOwnerGone(folder: folder)     // "call ended, still recording" nudge
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
@@ -826,6 +883,74 @@ final class RecorderMenuController: ObservableObject {
             "live audio warning=\(warning.rawValue) micEverHadAudio=\(micEverHadAudio) " +
             "systemRMS=\(stats.system.rms) micRMS=\(stats.mic.rms)"
         )
+    }
+
+    // MARK: - "Forgot to stop" supervision
+
+    /// Stop a recording that's clearly been left running: both channels quiet for a long stretch
+    /// (the meeting's over), or past the hard duration cap (a backstop for constant low-level noise
+    /// that never trips the silence rule). Both keep the audio — these are long recordings, so the
+    /// normal stop keeps and transcribes them — and notify so the stop isn't a surprise.
+    private func checkRecordingLimits(folder: URL) {
+        guard case .recording = state, currentFolder == folder,
+              let started = recordingStartedAt,
+              let stats = recordingCoordinator.currentStats else { return }
+        let now = Date()
+        let elapsed = now.timeIntervalSince(started)
+
+        if elapsed >= Self.maxRecordingSeconds {
+            DebugDiagnostics.log(recordingFolder: folder, "auto-stop: hit max duration")
+            notifyLeftRunning("Recording stopped after 3 hours.")
+            stopRecording()
+            return
+        }
+
+        // Both tracks quiet *right now* (recent loudness, not cumulative); any real sound on either
+        // resets the timer, so this needs a continuous silent stretch, not just a quiet average.
+        let bothQuiet = stats.mic.recentLevel < Self.liveSilenceLevel
+            && stats.system.recentLevel < Self.liveSilenceLevel
+        if bothQuiet {
+            let since = bothSilentSince ?? now
+            bothSilentSince = since
+            if now.timeIntervalSince(since) >= Self.bothSilentStopSeconds {
+                DebugDiagnostics.log(recordingFolder: folder, "auto-stop: 15 min of silence")
+                notifyLeftRunning("Recording stopped after 15 minutes of silence.")
+                stopRecording()
+            }
+        } else {
+            bothSilentSince = nil
+        }
+    }
+
+    /// If a call's app was holding the mic and then let it go, the meeting likely ended — nudge the
+    /// user (once) that we're still recording. We don't stop: a manual recording may be intentional
+    /// (the silence rule and cap are the actual stops). Only fires when there *was* an external
+    /// owner, so a mic-only/f2f recording never gets a spurious nudge.
+    private func checkCallOwnerGone(folder: URL) async {
+        guard case .recording = state, currentFolder == folder, !ownerGoneNotified else { return }
+        let owners = await micOwnerMonitor.refreshExternalOwners()
+            .subtracting(MicOwnerMonitor.nonMeetingOwners)
+        guard case .recording = state, currentFolder == folder else { return }  // re-check after await
+
+        if !owners.isEmpty {
+            recordingHadExternalOwner = true
+            externalOwnerGoneSince = nil
+            return
+        }
+        guard recordingHadExternalOwner else { return }
+
+        let now = Date()
+        let since = externalOwnerGoneSince ?? now
+        externalOwnerGoneSince = since
+        if now.timeIntervalSince(since) >= Self.ownerGoneNotifySeconds {
+            ownerGoneNotified = true
+            DebugDiagnostics.log(recordingFolder: folder, "forgot-to-stop nudge: call owner gone")
+            notifyLeftRunning("The call ended, but Meeting2 is still recording.")
+        }
+    }
+
+    private func notifyLeftRunning(_ body: String) {
+        UserNotifier.post(title: "Meeting2", body: body)
     }
 
     // MARK: - Error classification

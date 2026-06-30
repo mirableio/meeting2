@@ -57,8 +57,9 @@ final class RecordingCoordinator {
         recordingSession.currentStats
     }
 
-    /// How short an auto-detected take has to be before we treat it as junk and bin it.
-    private static let autoPruneMinimumSeconds: Double = 30
+    /// How short a take has to be before we treat it as junk and bin it. Shared by the auto-stop
+    /// prune and the manual-stop discard.
+    static let minimumKeepSeconds: Double = 30
 
     func start(source: MeetingSource = MeetingSource()) async throws -> RecordingSessionStartResult {
         try await recordingSession.start(source: source)
@@ -102,10 +103,26 @@ final class RecordingCoordinator {
         return RecordingCoordinatorStopResult(folder: stopped.folder, postRecordingTask: task)
     }
 
+    /// Stop and discard outright — used when the caller has already decided the take is junk (a
+    /// manually-stopped recording under `minimumKeepSeconds`). Trashes regardless of whether
+    /// finalize succeeded: the audio is closed either way and the folder is junk we want gone. Trash
+    /// is recoverable, so this is never lossy.
+    func stopAndDiscard() async throws {
+        let folder = currentFolder
+        // The finalize error is intentionally ignored — the recorder is already closed and we're
+        // discarding the folder regardless. The Trash move is NOT: if it fails the recording is
+        // still on disk, so this throws and the caller must not report success.
+        _ = try? await recordingSession.stop()
+        defer { notifyLibraryChanged() }  // reflect reality either way (folder gone, or still there)
+        if let folder {
+            try FileManager.default.trashItem(at: folder, resultingItemURL: nil)
+        }
+    }
+
     /// Prune only when we can *positively* judge the take as junk: the external owner held the mic
     /// for less than the minimum, or both tracks are explicitly silent. Anything else stays.
     private func shouldPruneAutoRecording(folder: URL, ownerActiveSeconds: TimeInterval) async -> Bool {
-        if ownerActiveSeconds < Self.autoPruneMinimumSeconds { return true }
+        if ownerActiveSeconds < Self.minimumKeepSeconds { return true }
         if let metadata = (try? await store.snapshot(folder: folder))?.metadata,
            metadata.audioHealth.micSilent == true, metadata.audioHealth.systemSilent == true {
             return true

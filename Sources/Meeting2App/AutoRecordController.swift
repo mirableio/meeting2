@@ -1,7 +1,6 @@
 import AppKit
 import Foundation
 import Meeting2Core
-import UserNotifications
 
 /// Auto-detect (online meetings only): when a *non-denylisted* app opens the mic, eagerly start a
 /// recording; when that app lets the mic go for a grace period, stop and let the coordinator keep or
@@ -24,19 +23,14 @@ final class AutoRecordController {
     private enum AutoState { case idle, starting, recording }
     private var autoState: AutoState = .idle
 
-    /// Known non-meeting mic owners to ignore. Best-effort and tunable (P2); unknown brief grabs get
-    /// recorded and then pruned by the short/silent rule. (Our own process is excluded by PID inside
-    /// `MicOwnerMonitor`, so it doesn't need to be listed here.)
-    ///
-    /// `com.apple.CoreSpeech` is the important one: with "Hey Siri"/dictation enabled it holds the
-    /// mic input *continuously*, so without it here auto-record fires the instant it's switched on.
-    private static let denylist: Set<String> = [
-        "com.apple.CoreSpeech",    // "Hey Siri" / on-device speech & dictation (always-on mic)
-        "com.apple.assistantd",    // Siri / the assistant daemon
-        "com.apple.corespeechd",   // older speech-daemon naming, kept defensively
-        "com.apple.VoiceOver",
-    ]
-    private static let stopGraceSeconds: TimeInterval = 120
+    /// Non-meeting mic owners to ignore — shared with the "forgot to stop" nudge. (Our own process
+    /// is excluded by PID inside `MicOwnerMonitor`, so it isn't listed here.)
+    private static let denylist = MicOwnerMonitor.nonMeetingOwners
+    // How long the external owner must be gone before we stop. Kept short: major conferencing
+    // apps hold the mic open while muted (so this isn't riding over mutes), it's really only for
+    // brief device/route blips — and a long grace makes a short meeting linger as a live recording
+    // for minutes before it's evaluated and pruned, which reads as "short recordings are kept".
+    private static let stopGraceSeconds: TimeInterval = 20
     private static let pollIntervalNanoseconds: UInt64 = 5 * 1_000_000_000
 
     init(controller: RecorderMenuController) {
@@ -137,20 +131,15 @@ final class AutoRecordController {
     // MARK: - Notification (informational; the menu Stop is the escape hatch)
 
     private func requestNotificationAuthorizationOnce() {
-        guard !notificationsRequested, Bundle.main.bundleIdentifier != nil else { return }
+        guard !notificationsRequested else { return }
         notificationsRequested = true
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
+        UserNotifier.requestAuthorization()
     }
 
     private func notifyStarted() {
-        // `UNUserNotificationCenter.current()` traps when there's no app bundle (e.g. the raw
-        // SwiftPM binary), so only touch it from a real .app. Best-effort: if it's denied, the menu
-        // Stop is still the way out.
-        guard Bundle.main.bundleIdentifier != nil else { return }
-        let content = UNMutableNotificationContent()
-        content.title = "Recording started"
-        content.body = "Meeting2 is recording what looks like a meeting. Stop it from the menu bar."
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+        UserNotifier.post(
+            title: "Recording started",
+            body: "Meeting2 is recording what looks like a meeting. Stop it from the menu bar."
+        )
     }
 }
