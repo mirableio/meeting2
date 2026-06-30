@@ -62,6 +62,50 @@ enum AudioObjectReader {
         return value
     }
 
+    /// Reads a variable-length list property (e.g. the process-object list) — query the byte size
+    /// first, then read that many `AudioObjectID`s.
+    static func readAudioObjectIDList(
+        _ objectID: AudioObjectID,
+        selector: AudioObjectPropertySelector
+    ) throws -> [AudioObjectID] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        try CaptureError.check(
+            AudioObjectGetPropertyDataSize(objectID, &address, 0, nil, &size),
+            "AudioObjectGetPropertyDataSize(\(selector))"
+        )
+        let count = Int(size) / MemoryLayout<AudioObjectID>.size
+        guard count > 0 else { return [] }
+        var ids = [AudioObjectID](repeating: AudioObjectID(kAudioObjectUnknown), count: count)
+        try CaptureError.check(
+            AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &ids),
+            "AudioObjectGetPropertyData([AudioObjectID] \(selector))"
+        )
+        return ids
+    }
+
+    static func readPID(
+        _ objectID: AudioObjectID,
+        selector: AudioObjectPropertySelector
+    ) throws -> pid_t {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: pid_t = 0
+        var size = UInt32(MemoryLayout<pid_t>.size)
+        try CaptureError.check(
+            AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value),
+            "AudioObjectGetPropertyData(pid_t \(selector))"
+        )
+        return value
+    }
+
     static func readCFString(
         _ objectID: AudioObjectID,
         selector: AudioObjectPropertySelector

@@ -39,7 +39,7 @@ final class RecordingSessionController {
         recorder?.currentStats
     }
 
-    func start(now: Date = Date()) async throws -> RecordingSessionStartResult {
+    func start(now: Date = Date(), source: MeetingSource = MeetingSource()) async throws -> RecordingSessionStartResult {
         guard recorder == nil else {
             throw CaptureError.invalidState("Recording already in progress")
         }
@@ -53,7 +53,7 @@ final class RecordingSessionController {
             // was actually playing (built-in speakers vs headphones). Compression uses this
             // to decide whether the mic alone already holds the whole conversation.
             let outputRoute = OutputRouteProbe.current()
-            _ = try await store.markRecordingStarted(folder: folder, startedAt: now, outputRoute: outputRoute)
+            _ = try await store.markRecordingStarted(folder: folder, startedAt: now, outputRoute: outputRoute, source: source)
             recorder = try await startRecorderOffMainActor(folder: folder)
             return RecordingSessionStartResult(folder: folder)
         } catch {

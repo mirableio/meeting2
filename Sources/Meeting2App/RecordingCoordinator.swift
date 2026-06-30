@@ -57,8 +57,11 @@ final class RecordingCoordinator {
         recordingSession.currentStats
     }
 
-    func start() async throws -> RecordingSessionStartResult {
-        try await recordingSession.start()
+    /// How short an auto-detected take has to be before we treat it as junk and bin it.
+    private static let autoPruneMinimumSeconds: Double = 30
+
+    func start(source: MeetingSource = MeetingSource()) async throws -> RecordingSessionStartResult {
+        try await recordingSession.start(source: source)
     }
 
     func stopAndProcess(
@@ -69,6 +72,45 @@ final class RecordingCoordinator {
             try await pipeline.runAfterRecording(folder: stopped.folder, onProgress: onProgress)
         }
         return RecordingCoordinatorStopResult(folder: stopped.folder, postRecordingTask: task)
+    }
+
+    /// Stop an auto-detected take and *then* decide what to do with it. Unlike `stopAndProcess`,
+    /// which always enqueues the pipeline immediately, a provisional auto recording is judged first:
+    /// a too-short or fully-silent take is moved to the Trash (recoverable), anything else is kept
+    /// and enqueued exactly like a manual stop. Returns `nil` when the take was discarded.
+    ///
+    /// `ownerActiveSeconds` is how long the external mic owner actually held the mic — the real
+    /// meeting length. "Too short" is judged on *that*, not the finalized recording duration, which
+    /// also includes the stop grace (so a 5-second grab would otherwise look like a ~125-second
+    /// file and survive).
+    ///
+    /// Keep-on-uncertainty: the both-silent check needs a finalized snapshot; if we can't read it,
+    /// we KEEP and enqueue — never Trash a recording we can't actually judge ("never miss").
+    func stopAutoRecording(
+        ownerActiveSeconds: TimeInterval,
+        onProgress: PostRecordingProgressHandler? = nil
+    ) async throws -> RecordingCoordinatorStopResult? {
+        let stopped = try await recordingSession.stop()
+        if await shouldPruneAutoRecording(folder: stopped.folder, ownerActiveSeconds: ownerActiveSeconds) {
+            try FileManager.default.trashItem(at: stopped.folder, resultingItemURL: nil)
+            notifyLibraryChanged()
+            return nil
+        }
+        let task = enqueuePostRecording { pipeline in
+            try await pipeline.runAfterRecording(folder: stopped.folder, onProgress: onProgress)
+        }
+        return RecordingCoordinatorStopResult(folder: stopped.folder, postRecordingTask: task)
+    }
+
+    /// Prune only when we can *positively* judge the take as junk: the external owner held the mic
+    /// for less than the minimum, or both tracks are explicitly silent. Anything else stays.
+    private func shouldPruneAutoRecording(folder: URL, ownerActiveSeconds: TimeInterval) async -> Bool {
+        if ownerActiveSeconds < Self.autoPruneMinimumSeconds { return true }
+        if let metadata = (try? await store.snapshot(folder: folder))?.metadata,
+           metadata.audioHealth.micSilent == true, metadata.audioHealth.systemSilent == true {
+            return true
+        }
+        return false
     }
 
     func recoverInterruptedRecordings() async throws -> [MeetingRecoveryResult] {

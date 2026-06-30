@@ -93,6 +93,8 @@ final class RecorderMenuController: ObservableObject {
     @Published private(set) var processingActivity: ProcessingActivity?
     @Published private(set) var pendingTranscriptionCount = 0
     @Published private(set) var successFlashActive = false
+    /// User opt-in for auto-detect (off by default). Persisted; mirrored by the menu checkmark.
+    @Published private(set) var autoRecordEnabled: Bool
     @Published private var recordingElapsedSeconds = 0
     @Published private var isBusyStateVisible = false
 
@@ -101,6 +103,11 @@ final class RecorderMenuController: ObservableObject {
     /// Set by `AppDelegate` to open the recordings window from the menu — keeps the controller
     /// from knowing about the window/library types.
     var onOpenRecordings: (() -> Void)?
+
+    /// Set by `AppDelegate` to start/stop the mic-owner monitor when auto-record is toggled —
+    /// keeps the controller from knowing about the detection subsystem.
+    var onAutoRecordChanged: ((Bool) -> Void)?
+    private static let autoRecordDefaultsKey = "AutoRecordEnabled"
 
     private let recordingCoordinator: RecordingCoordinator
     private var hotKey: GlobalHotKey?
@@ -125,6 +132,7 @@ final class RecorderMenuController: ObservableObject {
 
     init(coordinator: RecordingCoordinator) {
         recordingCoordinator = coordinator
+        autoRecordEnabled = UserDefaults.standard.bool(forKey: Self.autoRecordDefaultsKey)
 
         // Global ⌃⌘R toggles recording without opening the menu (the fast path). The
         // Carbon handler fires on the main thread, so hop straight onto the main actor.
@@ -280,8 +288,11 @@ final class RecorderMenuController: ObservableObject {
         }
     }
 
-    func startRecording() {
-        guard canStart else { return }
+    /// `completion` reports whether capture actually started (true) or failed (false), on the main
+    /// actor — auto-detect needs the real outcome rather than assuming success, so it doesn't wedge
+    /// or notify on a failed start.
+    func startRecording(source: MeetingSource = MeetingSource(), completion: ((Bool) -> Void)? = nil) {
+        guard canStart else { completion?(false); return }
 
         lastError = nil
         liveAudioWarning = .none
@@ -299,7 +310,7 @@ final class RecorderMenuController: ObservableObject {
 
         Task {
             do {
-                let result = try await recordingCoordinator.start()
+                let result = try await recordingCoordinator.start(source: source)
                 currentFolder = result.folder
                 statusMessage = "Recording to \(result.folder.lastPathComponent)"
                 endBusyPresentation()
@@ -307,6 +318,7 @@ final class RecorderMenuController: ObservableObject {
                 startElapsedClock(startedAt: Date())
                 startHealthMonitor(folder: result.folder)
                 recordingCoordinator.notifyLibraryChanged()  // new live row
+                completion?(true)
             } catch {
                 endBusyPresentation()
                 stopHealthMonitor()
@@ -323,6 +335,7 @@ final class RecorderMenuController: ObservableObject {
                     addAttention(.startFailed(String(describing: error)))
                 }
                 DebugDiagnostics.log(recordingFolder: currentFolder, "menu start failed error=\(error)")
+                completion?(false)
             }
         }
     }
@@ -379,6 +392,50 @@ final class RecorderMenuController: ObservableObject {
         }
     }
 
+    /// Stop a recording that auto-detect started: same UI teardown as a manual stop, but the
+    /// coordinator may *discard* the take (too short / silent) instead of enqueuing transcription.
+    /// `ownerActiveSeconds` is how long the external mic owner was actually present — the real
+    /// meeting length — which is what "too short" is judged on (not the recording wall-clock, which
+    /// also includes the stop grace).
+    func stopAutoRecording(ownerActiveSeconds: TimeInterval) {
+        guard recordingCoordinator.canStop else { return }
+
+        stopHealthMonitor()
+        stopElapsedClock()
+        liveAudioWarning = .none
+        beginBusyPresentation(to: .stopping, delayedStatusMessage: "Stopping recording...")
+
+        Task {
+            do {
+                let result = try await recordingCoordinator.stopAutoRecording(
+                    ownerActiveSeconds: ownerActiveSeconds,
+                    onProgress: progressHandler()
+                )
+                currentFolder = nil
+                endBusyPresentation()
+                state = .idle
+                if let result {
+                    lastFolder = result.folder
+                    statusMessage = "Saved \(result.folder.lastPathComponent)"
+                    recordingCoordinator.notifyLibraryChanged()
+                    observePostRecording(result.postRecordingTask, silent: false)
+                } else {
+                    // Discarded — the provisional row created at start is now gone.
+                    statusMessage = "Discarded a short auto-recording"
+                    recordingCoordinator.notifyLibraryChanged()
+                }
+            } catch {
+                // Audio is safe (CAFs closed); leave the folder for launch recovery to finalize.
+                currentFolder = nil
+                lastFolder = recordingCoordinator.lastFolder
+                lastError = String(describing: error)
+                statusMessage = "Stop saved audio, metadata failed"
+                endBusyPresentation()
+                state = .idle
+            }
+        }
+    }
+
     func transcribePendingRecordings() {
         observePostRecording(
             recordingCoordinator.runPendingTranscriptionOnly(onProgress: progressHandler()),
@@ -430,6 +487,15 @@ final class RecorderMenuController: ObservableObject {
         // Route the status-menu Quit through `applicationShouldTerminate` (→ `terminationReply`)
         // so every quit path shares one guard.
         NSApplication.shared.terminate(nil)
+    }
+
+    func toggleAutoRecord() { setAutoRecord(!autoRecordEnabled) }
+
+    func setAutoRecord(_ enabled: Bool) {
+        guard enabled != autoRecordEnabled else { return }
+        autoRecordEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.autoRecordDefaultsKey)
+        onAutoRecordChanged?(enabled)
     }
 
     /// The single decision for every quit path (⌘Q, Dock, Apple-menu, status-menu, logout). Never
@@ -790,6 +856,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItemController: StatusItemController?
     private var library: RecordingsLibraryViewModel?
     private var windowController: RecordingsWindowController?
+    private var autoRecordController: AutoRecordController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // One shared coordinator (store + pipeline), injected into both the menu and the
@@ -810,6 +877,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let windowController = RecordingsWindowController(viewModel: library)
         self.windowController = windowController
         controller.onOpenRecordings = { [weak windowController] in windowController?.show() }
+
+        // Auto-detect: the controller owns the opt-in setting; we start/stop the mic-owner monitor
+        // when it changes, and honour the persisted setting at launch.
+        let autoRecordController = AutoRecordController(controller: controller)
+        self.autoRecordController = autoRecordController
+        controller.onAutoRecordChanged = { [weak autoRecordController] enabled in
+            if enabled { autoRecordController?.enable() } else { autoRecordController?.disable() }
+        }
+        if controller.autoRecordEnabled { autoRecordController.enable() }
 
         // A minimal main menu so the recordings window behaves like a normal window while it's
         // up (⌘W to close, ⌘Q to quit, and Cut/Copy/Paste/Select-All in the rename field). It's

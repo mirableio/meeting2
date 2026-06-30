@@ -265,6 +265,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             controller.attention.map(\.id).joined(separator: ","),
             (controller.currentFolder != nil || controller.lastFolder != nil) ? "reveal" : "",
             controller.isRecording ? "rec" : "",
+            controller.autoRecordEnabled ? "auto" : "",
             "pending:\(controller.pendingTranscriptionCount)",
             // Include the bullet so the open menu rebuilds when work starts/ends, even if the
             // header text alone didn't change.
@@ -354,6 +355,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             let title = "Transcribe \(count) Pending Recording\(count == 1 ? "" : "s")"
             menu.addItem(action(title, #selector(transcribePending)))
         }
+
+        menu.addItem(.separator())
+
+        // Opt-in auto-detect. A checkmark (not a coloured bullet) reads as a persistent setting.
+        let autoItem = action("Record Meetings Automatically", #selector(toggleAutoRecord))
+        autoItem.state = controller.autoRecordEnabled ? .on : .off
+        menu.addItem(autoItem)
 
         menu.addItem(.separator())
         menu.addItem(action("Quit Meeting2", #selector(quit), key: "q", mask: [.command]))
@@ -457,6 +465,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func openRecordings() { controller.openRecordings() }
     @objc private func openRecordingsFolder() { controller.openRecordingsFolder() }
     @objc private func transcribePending() { controller.transcribePendingRecordings() }
+    @objc private func toggleAutoRecord() { controller.toggleAutoRecord() }
     @objc private func quit() { controller.quit() }
 
     @objc private func dismissAttentionItem(_ sender: NSMenuItem) {

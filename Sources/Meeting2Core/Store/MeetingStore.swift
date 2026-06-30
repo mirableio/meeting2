@@ -52,7 +52,8 @@ public actor MeetingStore {
     public func markRecordingStarted(
         folder: URL,
         startedAt: Date = Date(),
-        outputRoute: OutputRoute? = nil
+        outputRoute: OutputRoute? = nil,
+        source: MeetingSource = MeetingSource()
     ) throws -> MeetingMetadata {
         let metadataURL = Self.metadataURL(in: folder)
         let existing = FileManager.default.fileExists(atPath: metadataURL.path)
@@ -74,6 +75,8 @@ public actor MeetingStore {
         // metadata and never rewrites the field, so it survives both clean stop and crash
         // recovery; a recovered crash with no start record stays nil (unknown).
         metadata.outputRoute = outputRoute
+        // Who held the mic when capture began (set by auto-detect; empty for a manual start).
+        metadata.source = source
 
         try AtomicJSON.write(metadata, to: metadataURL)
         DebugDiagnostics.log(recordingFolder: folder, "meeting metadata started id=\(metadata.id)")
