@@ -29,6 +29,7 @@ TRANSCRIPTION_MODEL ?= $(GEMINI_MODEL)
 RECORDINGS_ROOT ?= $(HOME)/Recordings/Meetings
 TRASH_ROOT ?= $(HOME)/.Trash
 DRY_RUN ?= 0
+APPLICATIONS_DIR ?= /Applications
 
 APP := .build/$(CONFIG)/CaptureHarness.app
 HARNESS := $(APP)/Contents/MacOS/CaptureHarness
@@ -39,10 +40,14 @@ RECOVERY_TOOL := .build/$(CONFIG)/MeetingRecoveryTool
 COMPRESSION_TOOL := .build/$(CONFIG)/MeetingCompressionTool
 TRANSCRIPTION_TOOL := .build/$(CONFIG)/MeetingTranscriptionTool
 
-.PHONY: build dev-package dev-package-app dev-open-app dev-audio-devices dev-smoke dev-smoke-system dev-smoke-crash dev-smoke-route dev-smoke-route-auto dev-smoke-align dev-recover dev-compress dev-combine-stereo dev-transcribe dev-transcribe-fixture dev-clean-retained-tracks dev-clean
+.PHONY: build dev-test dev-package dev-package-app dev-open-app dev-link-app dev-audio-devices dev-smoke dev-smoke-system dev-smoke-crash dev-smoke-route dev-smoke-route-auto dev-smoke-align dev-recover dev-compress dev-combine-stereo dev-transcribe dev-transcribe-fixture dev-clean-retained-tracks dev-clean
 
 build:
 	swift build --configuration $(CONFIG)
+
+# Includes detector timing and delayed-callback regressions without opening audio devices.
+dev-test:
+	swift test --configuration $(CONFIG)
 
 dev-package:
 	CONFIG=$(CONFIG) scripts/package_capture_harness.sh
@@ -52,6 +57,16 @@ dev-package-app:
 
 dev-open-app: dev-package-app
 	open "$(MENU_APP)"
+
+# A development shortcut, not a second app copy: subsequent packaging updates the same target.
+# Reuse an existing bundle so linking cannot replace the executable of a running recording.
+dev-link-app:
+	@if [ -e "$(APPLICATIONS_DIR)/Meeting2.app" ] && [ ! -L "$(APPLICATIONS_DIR)/Meeting2.app" ]; then \
+		echo "Refusing to replace $(APPLICATIONS_DIR)/Meeting2.app: it is not a symlink." >&2; exit 1; \
+	fi
+	@test -x "$(MENU_APP)/Contents/MacOS/Meeting2" || $(MAKE) dev-package-app
+	mkdir -p "$(APPLICATIONS_DIR)"
+	ln -sfn "$(abspath $(MENU_APP))" "$(APPLICATIONS_DIR)/Meeting2.app"
 
 dev-audio-devices: build
 	"$(AUDIO_TOOL)" list-output

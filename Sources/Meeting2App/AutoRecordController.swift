@@ -1,145 +1,179 @@
-import AppKit
 import Foundation
 import Meeting2Core
 
-/// Auto-detect (online meetings only): when a *non-denylisted* app opens the mic, eagerly start a
-/// recording; when that app lets the mic go for a grace period, stop and let the coordinator keep or
-/// prune the take. F2F meetings have no external mic owner, so they can't be detected — that stays
-/// manual by design (see plans/AUTODETECT.md).
-///
-/// This drives the same `RecorderMenuController` commands the menu does, so the status item, live
-/// row, elapsed clock, and pipeline all behave exactly as for a manual start. The only thing it owns
-/// is the *policy*: the denylist gate, the poll, and the start notification.
+/// The small command boundary needed to test delayed HAL results without creating real audio
+/// files. Production still uses the exact same start/stop commands as the status menu.
+@MainActor
+protocol AutoRecordingCommands: AnyObject {
+    var canStart: Bool { get }
+    var canStop: Bool { get }
+    var currentFolder: URL? { get }
+    func startRecording(source: MeetingSource, completion: ((Bool) -> Void)?)
+    func stopAutoRecording(ownerActiveSeconds: TimeInterval)
+}
+
+/// Only genuine stop commands install restrictions. Owner disappearance is a normal end, while
+/// the silence/duration limits must not turn into an endless stop-and-restart loop.
+enum RecordingStopReason: CaseIterable {
+    case manual, silenceLimit, durationLimit, ownersGone, quit
+    var restrictsRestart: Bool { self != .ownersGone }
+}
+
+/// Observes without opening the mic, then applies policy through the recording command surface.
+/// Folder checks protect recordings; the generation also invalidates reads across disable/enable
+/// and fast Stop/Start cycles that could otherwise return to the same idle state.
 @MainActor
 final class AutoRecordController {
-    private let controller: RecorderMenuController
-    private let monitor = MicOwnerMonitor()
+    private let controller: any AutoRecordingCommands
+    private let preferences: AutoRecordPreferences
+    private let monitor: MicOwnerMonitor
+    private let readOwners: () async -> [MicOwner]?
+    private let now: () -> TimeInterval
     private var pollTask: Task<Void, Never>?
-    private var enabled = false
-    private var notificationsRequested = false
+    private var policy = AutoRecordPolicy()
+    private var generation: UInt64 = 0
+    private var reading = false
+    private var checkRequested = false
+    private var starting = false
+    private var latestOwners: Set<String>?
+    private var latestFolder: URL?
+    private var lastLog: String?
+    private var automaticSession: (folder: URL, detectedAt: TimeInterval, owners: Set<String>, isFirstDetection: Bool)?
 
-    /// A tiny state machine so the poll can tell "we're waiting for our start to take hold" apart
-    /// from "the recording ended" — both read as `!canStop` otherwise.
-    private enum AutoState { case idle, starting, recording }
-    private var autoState: AutoState = .idle
-
-    /// Non-meeting mic owners to ignore — shared with the "forgot to stop" nudge. (Our own process
-    /// is excluded by PID inside `MicOwnerMonitor`, so it isn't listed here.)
-    private static let denylist = MicOwnerMonitor.nonMeetingOwners
-    // How long the external owner must be gone before we stop. Kept short: major conferencing
-    // apps hold the mic open while muted (so this isn't riding over mutes), it's really only for
-    // brief device/route blips — and a long grace makes a short meeting linger as a live recording
-    // for minutes before it's evaluated and pruned, which reads as "short recordings are kept".
-    private static let stopGraceSeconds: TimeInterval = 20
-    private static let pollIntervalNanoseconds: UInt64 = 5 * 1_000_000_000
-
-    init(controller: RecorderMenuController) {
+    init(
+        controller: any AutoRecordingCommands, preferences: AutoRecordPreferences,
+        monitor: MicOwnerMonitor = MicOwnerMonitor(),
+        readOwners: (() async -> [MicOwner]?)? = nil,
+        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    ) {
         self.controller = controller
+        self.preferences = preferences
+        self.monitor = monitor
+        self.readOwners = readOwners ?? { await monitor.refreshExternalOwners() }
+        self.now = now
     }
 
     func enable() {
-        guard !enabled else { return }
-        enabled = true
-        requestNotificationAuthorizationOnce()
+        guard pollTask == nil else { return }
+        generation &+= 1
+        UserNotifier.requestAuthorization()
         monitor.onWake = { [weak self] in
-            MainActor.assumeIsolated { self?.maybeStart() }
+            MainActor.assumeIsolated { self?.requestCheck() }
         }
         monitor.start()
-        // The mic may already be hot (launched with auto-record on during a call, or toggled on
-        // mid-call) — there'd be no new HAL edge, so check once now.
-        maybeStart()
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.checkOwners()
+                do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
+            }
+        }
     }
 
     func disable() {
-        guard enabled else { return }
-        enabled = false
+        generation &+= 1
         monitor.onWake = nil
         monitor.stop()
         pollTask?.cancel()
         pollTask = nil
-        autoState = .idle
+        automaticSession = nil
+        starting = false
+        policy = AutoRecordPolicy()
+        latestOwners = nil
     }
 
-    // MARK: - Start
-
-    private func maybeStart() {
-        guard enabled, autoState == .idle, controller.canStart else { return }
-        Task {
-            let owners = await monitor.refreshExternalOwners().subtracting(Self.denylist)
-            // Re-check the gate after the await — state may have moved while we read HAL.
-            guard enabled, autoState == .idle, controller.canStart, !owners.isEmpty else { return }
-            // Sets are unordered; pick deterministically and log the full set.
-            let owner = owners.sorted().first!
-            DebugDiagnostics.log("auto-record start owner=\(owner) owners=\(owners.sorted())")
-            autoState = .starting
-            // Stamp the meeting's start *now*, when the owner is confirmed present — not in the
-            // completion below. `startRecording` can block/retry in Core Audio for seconds, and that
-            // startup is time the owner was already active; measuring from the completion would
-            // understate the meeting length and wrongly prune short-but-valid calls.
-            let detectedAt = Date()
-            controller.startRecording(source: MeetingSource(micOwnerBundleId: owner)) { [weak self] started in
-                guard let self, self.enabled else { return }
-                if started {
-                    // Only now is it really recording — notify, and start judging liveness.
-                    self.autoState = .recording
-                    self.notifyStarted()
-                    self.startPolling(detectedAt: detectedAt)
-                } else {
-                    // Capture failed — reset so a later mic-owner wake-up can try again (no wedge).
-                    self.autoState = .idle
-                }
-            }
+    func requestCheck() {
+        let token = generation
+        Task { [weak self] in
+            guard let self, self.generation == token else { return }
+            await self.checkOwners()
         }
     }
 
-    // MARK: - Stop (poll the external owner while recording)
+    /// Called synchronously by every stop path, before capture teardown or short-take pruning.
+    /// Only an observation for this recording can identify its owners. A failed or pending read
+    /// leaves ownership uncertain; an older snapshot cannot prove who is holding the mic now.
+    func recordingWillStop(folder: URL, reason: RecordingStopReason) {
+        guard preferences.enabled, controller.currentFolder == folder else { return }
+        generation &+= 1
+        if reason.restrictsRestart {
+            let owners = latestFolder == folder && !reading ? latestOwners : nil
+            policy.restrict(owners.map { preferences.eligibleOwners($0) })
+        }
+        automaticSession = nil
+        latestOwners = nil
+        starting = false
+        policy.recordingChanged()
+    }
 
-    private func startPolling(detectedAt: Date) {
-        pollTask?.cancel()
-        pollTask = Task { [weak self] in
-            var ownerGoneSince: Date?
-            while !Task.isCancelled {
-                guard let self, self.enabled, self.autoState == .recording else { return }
+    var disableTarget: ObservedApp? {
+        guard preferences.enabled, controller.canStop, let session = automaticSession,
+              session.isFirstDetection,
+              session.folder == controller.currentFolder, latestFolder == session.folder,
+              session.owners.count == 1, let owners = latestOwners else { return nil }
+        let eligible = preferences.eligibleOwners(owners)
+        guard eligible == session.owners, let id = eligible.first else { return nil }
+        return preferences.apps.first { $0.bundleID == id }
+    }
 
-                if !self.controller.canStop {
-                    // Ended by another path (manual Stop / quit); the take is kept by that path.
-                    self.autoState = .idle
-                    return
-                }
-                let live = !(await self.monitor.refreshExternalOwners())
-                    .subtracting(Self.denylist).isEmpty
-                if live {
-                    ownerGoneSince = nil
-                } else {
-                    let goneSince = ownerGoneSince ?? Date()
-                    ownerGoneSince = goneSince
-                    if Date().timeIntervalSince(goneSince) >= Self.stopGraceSeconds {
-                        // The real meeting length is detection → owner left, excluding the grace.
-                        self.autoState = .idle
-                        self.controller.stopAutoRecording(
-                            ownerActiveSeconds: goneSince.timeIntervalSince(detectedAt)
-                        )
-                        return
-                    }
-                }
-
-                try? await Task.sleep(nanoseconds: Self.pollIntervalNanoseconds)
+    /// Internal so regression tests can suspend a real controller read across Stop/Start. The
+    /// tests replace only commands and the owner read, not the async orchestration under test.
+    func checkOwners() async {
+        guard preferences.enabled, !starting else { return }
+        guard !reading else { checkRequested = true; return }
+        reading = true
+        defer {
+            reading = false
+            if checkRequested {
+                checkRequested = false
+                requestCheck()
             }
         }
-    }
+        let token = generation
+        let folder = controller.currentFolder
+        if automaticSession?.folder != folder {
+            automaticSession = nil
+            policy.recordingChanged()
+        }
+        let result = await readOwners()
+        guard !Task.isCancelled, preferences.enabled, generation == token,
+              controller.currentFolder == folder else { return }
+        let discovered = result.map { preferences.observe($0) } ?? []
+        let owners = result.map { Set($0.map(\.bundleID)) }
+        let eligible = preferences.eligibleOwners(owners ?? [])
+        latestOwners = owners
+        latestFolder = folder
+        let log = owners.map { "owners=\($0.sorted()) eligible=\(eligible.sorted())" } ?? "owners=unknown"
+        if log != lastLog { DebugDiagnostics.log("auto-record \(log)"); lastLog = log }
 
-    // MARK: - Notification (informational; the menu Stop is the escape hatch)
-
-    private func requestNotificationAuthorizationOnce() {
-        guard !notificationsRequested else { return }
-        notificationsRequested = true
-        UserNotifier.requestAuthorization()
-    }
-
-    private func notifyStarted() {
-        UserNotifier.post(
-            title: "Recording started",
-            body: "Meeting2 is recording what looks like a meeting. Stop it from the menu bar."
+        let decision = policy.evaluate(
+            owners: owners, eligible: eligible, canStart: controller.canStart,
+            detectedAt: controller.canStop ? automaticSession?.detectedAt : nil, now: now()
         )
+        switch decision {
+        case .none:
+            break
+        case .start(let owner):
+            starting = true
+            let detectedAt = now()
+            controller.startRecording(source: MeetingSource(micOwnerBundleId: owner)) { [weak self] started in
+                guard let self, self.preferences.enabled, self.generation == token else { return }
+                self.starting = false
+                if started, let folder = self.controller.currentFolder, self.controller.canStop {
+                    // Keep the discovery action through subsequent polls of this recording,
+                    // but never offer it again once the app is already in the saved list.
+                    self.automaticSession = (folder, detectedAt, eligible, discovered.contains(owner))
+                    self.latestFolder = folder
+                    UserNotifier.post(title: "Recording started", body: "Meeting2 is recording what looks like a meeting. Stop it from the menu bar.")
+                } else {
+                    // A failed capture already offers Try Again in the menu. Polling must not
+                    // repeatedly retry the same owner and create failed folders every five seconds.
+                    self.policy.restrict(eligible)
+                }
+            }
+        case .stop(let seconds):
+            guard let session = automaticSession, session.folder == controller.currentFolder,
+                  controller.canStop, generation == token else { return }
+            controller.stopAutoRecording(ownerActiveSeconds: seconds)
+        }
     }
 }

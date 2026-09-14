@@ -1,6 +1,18 @@
 import CoreAudio
 import Foundation
 
+/// HAL's reported identity, without guessing which application owns a helper. PID is used only
+/// for self-exclusion and best-effort presentation; bundle ID is the durable preference key.
+public struct MicOwner: Equatable, Sendable {
+    public let bundleID: String
+    public let pid: pid_t
+
+    public init(bundleID: String, pid: pid_t) {
+        self.bundleID = bundleID
+        self.pid = pid
+    }
+}
+
 /// Watches the default input device so auto-detect can answer two questions without ever opening
 /// the mic itself: "did the mic just go hot?" (the idle wake-up) and "which *other* apps hold the
 /// mic right now?" (the start gate and the recording-liveness check). Pure observation.
@@ -9,19 +21,10 @@ import Foundation
 /// so they must stay off the main actor (the rest of the capture code learned the same). The only
 /// thing that touches the main thread is the `onWake` hop.
 ///
-/// Why a poll and not just the listener: once Meeting2 starts recording it holds the input device,
-/// so `DeviceIsRunningSomewhere` stays true and stops edging. The listener is therefore only a
-/// wake-up for the idle path; the active recording path calls `refreshExternalOwners()` on a timer.
+/// The device listener is only a fast wake-up. Owners must also be polled while idle: another
+/// device can be in use, or an ignored app can already hold the watched microphone open.
 public final class MicOwnerMonitor {
-    /// Mic owners that aren't meetings — always-on speech services etc. `com.apple.CoreSpeech` is
-    /// the important one: with "Hey Siri"/dictation enabled it holds the mic input *continuously*.
-    /// Best-effort and tunable; shared by auto-detect (start gate) and the "forgot to stop" nudge.
-    public static let nonMeetingOwners: Set<String> = [
-        "com.apple.CoreSpeech",    // "Hey Siri" / on-device speech & dictation (always-on mic)
-        "com.apple.assistantd",    // Siri / the assistant daemon
-        "com.apple.corespeechd",   // older speech-daemon naming, kept defensively
-        "com.apple.VoiceOver",
-    ]
+    public static let meeting2BundleID = "com.mirable.Meeting2"
 
     /// Called (on the main thread) when the input device's running state changes — "go look at the
     /// owners." Set by the owner before `start()`.
@@ -42,11 +45,11 @@ public final class MicOwnerMonitor {
         queue.async { [weak self] in self?.removeListeners() }
     }
 
-    /// The live set of *external* mic-owner bundle ids (our own process excluded by PID). Reads HAL
-    /// on the serial queue, so the caller's actor never blocks on the system call. There is no
-    /// cached snapshot on purpose — while we hold the mic the listener stops firing, so a cache
-    /// would go stale and never show the owner leaving.
-    public func refreshExternalOwners() async -> Set<String> {
+    /// Nil means incomplete knowledge, not silence. In particular, losing one process during
+    /// enumeration must not become evidence for stopping or discarding a live recording.
+    /// Successful empty IDs are omitted: unbundled processes cannot be configured as app owners,
+    /// but must not make otherwise valid ownership information unavailable.
+    public func refreshExternalOwners() async -> [MicOwner]? {
         await withCheckedContinuation { continuation in
             queue.async { continuation.resume(returning: Self.readExternalOwners()) }
         }
@@ -55,6 +58,7 @@ public final class MicOwnerMonitor {
     // MARK: - Listeners (serial queue only)
 
     private func installListeners() {
+        guard defaultInputListener == nil else { return }
         // The default input device can change (plugging in a headset); re-bind the running-state
         // listener to the new device and treat the switch itself as a wake-up.
         var defaultAddress = Self.defaultInputAddress
@@ -110,27 +114,42 @@ public final class MicOwnerMonitor {
 
     // MARK: - Reads (serial queue only)
 
-    private static func readExternalOwners() -> Set<String> {
-        let me = getpid()
-        guard let processes = try? AudioObjectReader.readAudioObjectIDList(
-            AudioObjectID(kAudioObjectSystemObject), selector: kAudioHardwarePropertyProcessObjectList
-        ) else { return [] }
-
-        var owners: Set<String> = []
-        for process in processes {
-            guard let running = try? AudioObjectReader.readUInt32(
-                process, selector: kAudioProcessPropertyIsRunningInput
-            ), running != 0 else { continue }
-            // Self-exclusion is by PID, not bundle id, so our own capture never reads as an owner.
-            if let pid = try? AudioObjectReader.readPID(process, selector: kAudioProcessPropertyPID),
-               pid == me { continue }
-            if let bundle = try? AudioObjectReader.readCFString(
-                process, selector: kAudioProcessPropertyBundleID
-            ), !bundle.isEmpty {
-                owners.insert(bundle)
+    // These two read boundaries let tests reproduce HAL failures without opening a microphone.
+    // Any required-property failure invalidates the whole absence claim; presentation lookups
+    // happen later in the app layer and cannot invalidate a successfully identified owner.
+    static func readExternalOwners(
+        listProcesses: () throws -> [AudioObjectID] = {
+            try AudioObjectReader.readAudioObjectIDList(
+                AudioObjectID(kAudioObjectSystemObject), selector: kAudioHardwarePropertyProcessObjectList
+            )
+        },
+        readProcess: (AudioObjectID) throws -> MicOwner? = readActiveProcess
+    ) -> [MicOwner]? {
+        do {
+            var owners: [MicOwner] = []
+            for process in try listProcesses() {
+                guard let owner = try readProcess(process) else { continue }
+                guard owner.pid != getpid(), owner.bundleID != meeting2BundleID else { continue }
+                // HAL successfully returns an empty string for unbundled processes. That is an
+                // unsupported owner identity, not a read failure that should poison every app.
+                guard !owner.bundleID.isEmpty else { continue }
+                owners.append(owner)
             }
+            return owners
+        } catch {
+            return nil
         }
-        return owners
+    }
+
+    private static func readActiveProcess(_ process: AudioObjectID) throws -> MicOwner? {
+        let running = try AudioObjectReader.readUInt32(process, selector: kAudioProcessPropertyIsRunningInput)
+        guard running != 0 else { return nil }
+        let pid = try AudioObjectReader.readPID(process, selector: kAudioProcessPropertyPID)
+        guard pid != getpid() else { return nil }
+        return MicOwner(
+            bundleID: try AudioObjectReader.readCFString(process, selector: kAudioProcessPropertyBundleID),
+            pid: pid
+        )
     }
 
     private static let defaultInputAddress = AudioObjectPropertyAddress(

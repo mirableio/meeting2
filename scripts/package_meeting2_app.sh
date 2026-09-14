@@ -57,6 +57,9 @@ cat > "$INFO" <<'PLIST'
     <string>14.2</string>
     <key>LSUIElement</key>
     <true/>
+    <!-- Launch Services rejects duplicate bundle launches; the executable's lock also covers direct launches. -->
+    <key>LSMultipleInstancesProhibited</key>
+    <true/>
     <key>NSAudioCaptureUsageDescription</key>
     <string>Capture system audio so Meeting2 can save the sound played by this Mac during meetings.</string>
     <key>NSMicrophoneUsageDescription</key>

@@ -86,6 +86,13 @@ let package = Package(
             name: "Meeting2CoreTests",
             dependencies: ["Meeting2Core"],
             path: "Tests/Meeting2CoreTests"
+        ),
+        // App policy and async command tests run without launching the app's entry point or
+        // touching audio hardware. Keep them separate from the capture/store library tests.
+        .testTarget(
+            name: "Meeting2AppTests",
+            dependencies: ["Meeting2", "Meeting2Core"],
+            path: "Tests/Meeting2AppTests"
         )
     ]
 )

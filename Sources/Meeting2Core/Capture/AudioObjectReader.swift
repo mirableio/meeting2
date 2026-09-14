@@ -85,7 +85,9 @@ enum AudioObjectReader {
             AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &ids),
             "AudioObjectGetPropertyData([AudioObjectID] \(selector))"
         )
-        return ids
+        // A process can exit between the size query and the read. HAL returns the bytes actually
+        // used; trailing capacity is not a list of unknown objects to query on the next step.
+        return Array(ids.prefix(Int(size) / MemoryLayout<AudioObjectID>.size))
     }
 
     static func readPID(

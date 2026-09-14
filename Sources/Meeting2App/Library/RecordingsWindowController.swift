@@ -6,16 +6,16 @@ private extension NSToolbarItem.Identifier {
     static let recordingsSearch = NSToolbarItem.Identifier("recordingsSearch")
 }
 
-/// Owns the single recordings window: a native unified toolbar (filter + search) over a SwiftUI
-/// list. Also owns — entirely here, on every close path — the `.regular`⇄`.accessory` activation
-/// flip, so the window behaves like a normal app window while open and the app is pure menu-bar
-/// when it's closed.
+/// Owns the single recordings window and its refresh lifecycle. App activation belongs to the
+/// delegate because another user window may remain open or minimized when this one closes.
 @MainActor
 final class RecordingsWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate, NSSearchFieldDelegate {
     private let viewModel: RecordingsLibraryViewModel
     private var window: NSWindow?
     private weak var filterSegmented: NSSegmentedControl?
     private var filterMenu: NSMenu?
+    var onOpen: ((NSWindow) -> Void)?
+    var onClose: ((NSWindow) -> Void)?
 
     init(viewModel: RecordingsLibraryViewModel) {
         self.viewModel = viewModel
@@ -23,7 +23,7 @@ final class RecordingsWindowController: NSObject, NSWindowDelegate, NSToolbarDel
 
     func show() {
         let window = existingOrNewWindow()
-        NSApp.setActivationPolicy(.regular)
+        onOpen?(window)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         viewModel.startAutoRefresh()
@@ -60,7 +60,7 @@ final class RecordingsWindowController: NSObject, NSWindowDelegate, NSToolbarDel
 
     func windowWillClose(_ notification: Notification) {
         viewModel.stopAutoRefresh()
-        NSApp.setActivationPolicy(.accessory)
+        if let window = notification.object as? NSWindow { onClose?(window) }
     }
 
     // MARK: - Toolbar (native filter segmented control + search field)

@@ -1,6 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
 import Combine
+import Darwin
 import Foundation
 import Meeting2Core
 
@@ -78,7 +79,7 @@ enum Attention: Equatable, Identifiable {
 }
 
 @MainActor
-final class RecorderMenuController: ObservableObject {
+final class RecorderMenuController: ObservableObject, AutoRecordingCommands {
     // Presentation state for the menu-bar surface. Recording lifecycle and post-recording
     // work are reached through `RecordingCoordinator`, so future auto-detect can call the
     // same commands without depending on SwiftUI menu details. See plans/STATUS-UX.md for
@@ -93,8 +94,7 @@ final class RecorderMenuController: ObservableObject {
     @Published private(set) var processingActivity: ProcessingActivity?
     @Published private(set) var pendingTranscriptionCount = 0
     @Published private(set) var successFlashActive = false
-    /// User opt-in for auto-detect (off by default). Persisted; mirrored by the menu checkmark.
-    @Published private(set) var autoRecordEnabled: Bool
+    var autoRecordEnabled: Bool { preferences.enabled }
     @Published private var recordingElapsedSeconds = 0
     @Published private var isBusyStateVisible = false
 
@@ -103,13 +103,16 @@ final class RecorderMenuController: ObservableObject {
     /// Set by `AppDelegate` to open the recordings window from the menu — keeps the controller
     /// from knowing about the window/library types.
     var onOpenRecordings: (() -> Void)?
-
-    /// Set by `AppDelegate` to start/stop the mic-owner monitor when auto-record is toggled —
-    /// keeps the controller from knowing about the detection subsystem.
-    var onAutoRecordChanged: ((Bool) -> Void)?
-    private static let autoRecordDefaultsKey = "AutoRecordEnabled"
+    var onOpenSettings: (() -> Void)?
+    var onRecordingStarted: (() -> Void)?
+    // Notify before teardown, including the short-discard path. Sampling the eventual idle state
+    // would miss a quick Stop/Start and let polling undo an explicit or protective stop.
+    var onRecordingWillStop: ((URL, RecordingStopReason) -> Void)?
+    var autoRecordDisableTarget: (() -> ObservedApp?)?
 
     private let recordingCoordinator: RecordingCoordinator
+    private let preferences: AutoRecordPreferences
+    private var preferencesObservation: AnyCancellable?
     private var hotKey: GlobalHotKey?
     private var healthMonitorTask: Task<Void, Never>?
     private var elapsedClockTask: Task<Void, Never>?
@@ -118,13 +121,11 @@ final class RecorderMenuController: ObservableObject {
     private var micEverHadAudio = false
     private var systemSilentSince: Date?
     // "Forgot to stop" supervision (all recordings): both-channel silence, the external mic-owner
-    // nudge, and the hard duration cap. `micOwnerMonitor` is used only for on-demand owner reads
-    // during recording (no listener), independent of the auto-detect subsystem.
+    // nudge, and the hard duration cap. This consumer only reads the shared monitor; listener
+    // ownership stays with auto-detect, so disabling detection does not disable manual supervision.
     private var bothSilentSince: Date?
-    private var recordingHadExternalOwner = false
-    private var externalOwnerGoneSince: Date?
-    private var ownerGoneNotified = false
-    private let micOwnerMonitor = MicOwnerMonitor()
+    private var callOwnerNudge = CallOwnerNudge()
+    private let micOwnerMonitor: MicOwnerMonitor
     private var busyPresentationTask: Task<Void, Never>?
     private var busyPresentationSourceState: RecorderMenuState?
     /// Set when a quit arrives while a stop is already running, so the in-flight stop terminates on
@@ -140,11 +141,14 @@ final class RecorderMenuController: ObservableObject {
     // "Forgot to stop" thresholds.
     private static let bothSilentStopSeconds: TimeInterval = 15 * 60   // both channels quiet this long → stop
     private static let maxRecordingSeconds: TimeInterval = 3 * 60 * 60 // hard cap → stop
-    private static let ownerGoneNotifySeconds: TimeInterval = 3        // call's mic owner gone → nudge
 
-    init(coordinator: RecordingCoordinator) {
+    init(coordinator: RecordingCoordinator, preferences: AutoRecordPreferences, monitor: MicOwnerMonitor) {
         recordingCoordinator = coordinator
-        autoRecordEnabled = UserDefaults.standard.bool(forKey: Self.autoRecordDefaultsKey)
+        self.preferences = preferences
+        micOwnerMonitor = monitor
+        preferencesObservation = preferences.objectWillChange.sink { [weak self] in
+            self?.objectWillChange.send()
+        }
 
         // Global ⌃⌘R toggles recording without opening the menu (the fast path). The
         // Carbon handler fires on the main thread, so hop straight onto the main actor.
@@ -311,9 +315,7 @@ final class RecorderMenuController: ObservableObject {
         micEverHadAudio = false
         systemSilentSince = nil
         bothSilentSince = nil
-        recordingHadExternalOwner = false
-        externalOwnerGoneSince = nil
-        ownerGoneNotified = false
+        callOwnerNudge = CallOwnerNudge()
         UserNotifier.requestAuthorization()  // for the "forgot to stop" nudges (idempotent)
         endSuccessFlash()
         // Do NOT clear processingActivity/transcribingStartedAt here: a transcription from a
@@ -336,6 +338,7 @@ final class RecorderMenuController: ObservableObject {
                 startHealthMonitor(folder: result.folder)
                 recordingCoordinator.notifyLibraryChanged()  // new live row
                 completion?(true)
+                onRecordingStarted?()
             } catch {
                 endBusyPresentation()
                 stopHealthMonitor()
@@ -357,12 +360,16 @@ final class RecorderMenuController: ObservableObject {
         }
     }
 
-    func stopRecording(terminateAfterStop: Bool = false) {
-        guard recordingCoordinator.canStop else {
+    func stopRecording(terminateAfterStop: Bool = false, reason: RecordingStopReason = .manual) {
+        guard canStop else {
             if terminateAfterStop {
                 NSApplication.shared.terminate(nil)
             }
             return
+        }
+
+        if let folder = currentFolder {
+            onRecordingWillStop?(folder, terminateAfterStop ? .quit : reason)
         }
 
         // A recording stopped under the keep threshold is junk (an accidental or aborted start) —
@@ -453,7 +460,8 @@ final class RecorderMenuController: ObservableObject {
     /// meeting length — which is what "too short" is judged on (not the recording wall-clock, which
     /// also includes the stop grace).
     func stopAutoRecording(ownerActiveSeconds: TimeInterval) {
-        guard recordingCoordinator.canStop else { return }
+        guard canStop else { return }
+        if let folder = currentFolder { onRecordingWillStop?(folder, .ownersGone) }
 
         stopHealthMonitor()
         stopElapsedClock()
@@ -547,10 +555,21 @@ final class RecorderMenuController: ObservableObject {
     func toggleAutoRecord() { setAutoRecord(!autoRecordEnabled) }
 
     func setAutoRecord(_ enabled: Bool) {
-        guard enabled != autoRecordEnabled else { return }
-        autoRecordEnabled = enabled
-        UserDefaults.standard.set(enabled, forKey: Self.autoRecordDefaultsKey)
-        onAutoRecordChanged?(enabled)
+        preferences.setEnabled(enabled)
+    }
+
+    func openSettings() { onOpenSettings?() }
+
+    func stopAndDisableAutoRecording() {
+        guard canStop, let target = autoRecordDisableTarget?() else { return }
+        // Stop first so the restriction records the currently enabled owner. This also preserves
+        // the existing short-recording Trash behavior; this command does not invent a keep path.
+        stopRecording()
+        preferences.setAutoRecord(false, for: target.bundleID)
+    }
+
+    func resetCallOwnerNudge() {
+        callOwnerNudge = CallOwnerNudge()
     }
 
     /// The single decision for every quit path (⌘Q, Dock, Apple-menu, status-menu, logout). Never
@@ -901,7 +920,7 @@ final class RecorderMenuController: ObservableObject {
         if elapsed >= Self.maxRecordingSeconds {
             DebugDiagnostics.log(recordingFolder: folder, "auto-stop: hit max duration")
             notifyLeftRunning("Recording stopped after 3 hours.")
-            stopRecording()
+            stopRecording(reason: .durationLimit)
             return
         }
 
@@ -915,7 +934,7 @@ final class RecorderMenuController: ObservableObject {
             if now.timeIntervalSince(since) >= Self.bothSilentStopSeconds {
                 DebugDiagnostics.log(recordingFolder: folder, "auto-stop: 15 min of silence")
                 notifyLeftRunning("Recording stopped after 15 minutes of silence.")
-                stopRecording()
+                stopRecording(reason: .silenceLimit)
             }
         } else {
             bothSilentSince = nil
@@ -927,23 +946,13 @@ final class RecorderMenuController: ObservableObject {
     /// (the silence rule and cap are the actual stops). Only fires when there *was* an external
     /// owner, so a mic-only/f2f recording never gets a spurious nudge.
     private func checkCallOwnerGone(folder: URL) async {
-        guard case .recording = state, currentFolder == folder, !ownerGoneNotified else { return }
+        guard case .recording = state, currentFolder == folder else { return }
+        let revision = preferences.revision
         let owners = await micOwnerMonitor.refreshExternalOwners()
-            .subtracting(MicOwnerMonitor.nonMeetingOwners)
-        guard case .recording = state, currentFolder == folder else { return }  // re-check after await
-
-        if !owners.isEmpty {
-            recordingHadExternalOwner = true
-            externalOwnerGoneSince = nil
-            return
-        }
-        guard recordingHadExternalOwner else { return }
-
-        let now = Date()
-        let since = externalOwnerGoneSince ?? now
-        externalOwnerGoneSince = since
-        if now.timeIntervalSince(since) >= Self.ownerGoneNotifySeconds {
-            ownerGoneNotified = true
+        guard case .recording = state, currentFolder == folder, preferences.revision == revision else { return }
+        if let owners { preferences.observe(owners) }
+        let eligible = owners.map { preferences.eligibleOwners(Set($0.map(\.bundleID))) }
+        if callOwnerNudge.observe(eligible, now: ProcessInfo.processInfo.systemUptime) {
             DebugDiagnostics.log(recordingFolder: folder, "forgot-to-stop nudge: call owner gone")
             notifyLeftRunning("The call ended, but Meeting2 is still recording.")
         }
@@ -982,6 +991,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var library: RecordingsLibraryViewModel?
     private var windowController: RecordingsWindowController?
     private var autoRecordController: AutoRecordController?
+    private var settingsWindowController: SettingsWindowController?
+    // Track open user windows, not visibility: minimizing or hiding a window must not remove its
+    // Dock entry. Both window controllers report here, including the window currently closing.
+    private var openUserWindows: Set<NSWindow> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // One shared coordinator (store + pipeline), injected into both the menu and the
@@ -989,7 +1002,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let coordinator = RecordingCoordinator()
         self.coordinator = coordinator
 
-        let controller = RecorderMenuController(coordinator: coordinator)
+        let preferences = AutoRecordPreferences()
+        // One serial HAL reader serves all consumers. Only auto-detect installs listeners;
+        // Settings and manual-recording supervision can still request fresh reads when it is off.
+        let monitor = MicOwnerMonitor()
+        let controller = RecorderMenuController(coordinator: coordinator, preferences: preferences, monitor: monitor)
         self.controller = controller
         self.statusItemController = StatusItemController(controller: controller)
 
@@ -1000,22 +1017,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.library = library
 
         let windowController = RecordingsWindowController(viewModel: library)
+        windowController.onOpen = { [weak self] in self?.userWindowWillOpen($0) }
+        windowController.onClose = { [weak self] in self?.userWindowWillClose($0) }
         self.windowController = windowController
         controller.onOpenRecordings = { [weak windowController] in windowController?.show() }
 
-        // Auto-detect: the controller owns the opt-in setting; we start/stop the mic-owner monitor
-        // when it changes, and honour the persisted setting at launch.
-        let autoRecordController = AutoRecordController(controller: controller)
+        let autoRecordController = AutoRecordController(controller: controller, preferences: preferences, monitor: monitor)
         self.autoRecordController = autoRecordController
-        controller.onAutoRecordChanged = { [weak autoRecordController] enabled in
+        preferences.onEnabledChanged = { [weak autoRecordController] enabled in
             if enabled { autoRecordController?.enable() } else { autoRecordController?.disable() }
         }
+        preferences.onRulesChanged = { [weak controller, weak autoRecordController] in
+            controller?.resetCallOwnerNudge()
+            autoRecordController?.requestCheck()
+        }
+        controller.onRecordingWillStop = { [weak autoRecordController] folder, reason in
+            autoRecordController?.recordingWillStop(folder: folder, reason: reason)
+        }
+        controller.onRecordingStarted = { [weak autoRecordController] in autoRecordController?.requestCheck() }
+        controller.autoRecordDisableTarget = { [weak autoRecordController] in autoRecordController?.disableTarget }
+
+        let settings = SettingsWindowController(preferences: preferences, monitor: monitor)
+        settings.onOpen = { [weak self] in self?.userWindowWillOpen($0) }
+        settings.onClose = { [weak self] in self?.userWindowWillClose($0) }
+        self.settingsWindowController = settings
+        controller.onOpenSettings = { [weak settings] in settings?.show() }
         if controller.autoRecordEnabled { autoRecordController.enable() }
 
         // A minimal main menu so the recordings window behaves like a normal window while it's
         // up (⌘W to close, ⌘Q to quit, and Cut/Copy/Paste/Select-All in the rename field). It's
         // only shown when we flip to `.regular`; harmless to set at launch.
-        NSApp.mainMenu = Self.buildMainMenu()
+        NSApp.mainMenu = buildMainMenu()
 
         DebugDiagnostics.log("menu app launched")
     }
@@ -1028,7 +1060,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller?.terminationReply() ?? .terminateNow
     }
 
-    private static func buildMainMenu() -> NSMenu {
+    func userWindowWillOpen(_ window: NSWindow) {
+        openUserWindows.insert(window)
+        NSApp.setActivationPolicy(.regular)
+    }
+
+    func userWindowWillClose(_ window: NSWindow) {
+        openUserWindows.remove(window)
+        if openUserWindows.isEmpty { NSApp.setActivationPolicy(.accessory) }
+    }
+
+    @objc private func showSettings() { settingsWindowController?.show() }
+
+    private func buildMainMenu() -> NSMenu {
         let mainMenu = NSMenu()
 
         let appItem = NSMenuItem()
@@ -1036,6 +1080,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenu = NSMenu()
         appItem.submenu = appMenu
         appMenu.addItem(withTitle: "About Meeting2", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        let settingsItem = appMenu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
+        settingsItem.target = self
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide Meeting2", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
@@ -1065,13 +1111,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// Program entry runs on the main thread, which is the main actor's executor — assert that
-// so we can touch the @MainActor app objects. `run()` blocks here, keeping `appDelegate`
-// (held only weakly by NSApplication.delegate) alive for the process lifetime.
+// Acquire exclusivity before creating the delegate: even startup recovery and hot-key
+// registration must belong to just one process. Retain both the lock and the weakly registered
+// delegate explicitly through `run()`, including in optimized builds.
 MainActor.assumeIsolated {
+    let instanceLock: SingleInstanceLock
+    do {
+        guard let acquired = try SingleInstanceLock.acquire() else {
+            NSRunningApplication.runningApplications(withBundleIdentifier: MicOwnerMonitor.meeting2BundleID)
+                .first { $0.processIdentifier != getpid() }?
+                .activate(options: [])
+            return
+        }
+        instanceLock = acquired
+    } catch {
+        FileHandle.standardError.write(Data("Meeting2 could not acquire its instance lock: \(error)\n".utf8))
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        application.activate(ignoringOtherApps: true)
+        let alert = NSAlert(error: error)
+        alert.messageText = "Meeting2 Couldn't Start"
+        alert.runModal()
+        exit(EXIT_FAILURE)
+    }
     let application = NSApplication.shared
     application.setActivationPolicy(.accessory)  // menu-bar only: no Dock icon
     let appDelegate = AppDelegate()
     application.delegate = appDelegate
-    application.run()
+    withExtendedLifetime((instanceLock, appDelegate)) {
+        application.run()
+    }
 }

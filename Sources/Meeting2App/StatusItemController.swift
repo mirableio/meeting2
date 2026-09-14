@@ -54,6 +54,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // status headers come back *enabled* when we rebuild the menu live while it's open,
         // because the auto-validation pass only runs on the normal open cycle.
         menu.autoenablesItems = false
+        // Detection uses the regular image slot for its check, not a second state-image column.
+        menu.showsStateColumn = false
         statusItem.menu = menu
 
         // Redraw the icon whenever the controller's state changes. `objectWillChange`
@@ -266,6 +268,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             (controller.currentFolder != nil || controller.lastFolder != nil) ? "reveal" : "",
             controller.isRecording ? "rec" : "",
             controller.autoRecordEnabled ? "auto" : "",
+            controller.autoRecordDisableTarget?()?.bundleID ?? "",
+            controller.autoRecordDisableTarget?()?.name ?? "",
             "pending:\(controller.pendingTranscriptionCount)",
             // Include the bullet so the open menu rebuilds when work starts/ends, even if the
             // header text alone didn't change.
@@ -303,26 +307,29 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
 
         // Primary action: only the one that applies. ⌃⌘R mirrors the global hotkey.
-        // A red ● fronts Start so the "record" affordance reads at a glance, echoing the
-        // dot the header shows once recording is live.
+        // Keep the recording controls' red cues in AppKit's image slot; ordinary commands
+        // need only their labels.
         if controller.canStart {
             menu.addItem(action(
                 "Start Recording",
                 #selector(startRecording),
                 key: "r",
                 mask: [.command, .control],
-                bulletColor: .systemRed
+                symbol: "circle.fill",
+                color: .systemRed
             ))
         } else if controller.canStop {
-            // A hollow red □ fronts Stop, pairing with the filled ● on Start (record vs. stop).
             menu.addItem(action(
                 "Stop Recording",
                 #selector(stopRecording),
                 key: "r",
                 mask: [.command, .control],
-                bulletColor: .systemRed,
-                bulletGlyph: "□"
+                symbol: "stop.fill",
+                color: .systemRed
             ))
+            if let target = controller.autoRecordDisableTarget?() {
+                menu.addItem(action("Stop and Disable Auto-record for \(target.name)", #selector(stopAndDisableAutoRecording)))
+            }
         }
 
         // A problem promotes its fix to first-class actions.
@@ -358,13 +365,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        // Opt-in auto-detect. A checkmark (not a coloured bullet) reads as a persistent setting.
-        let autoItem = action("Record Meetings Automatically", #selector(toggleAutoRecord))
-        autoItem.state = controller.autoRecordEnabled ? .on : .off
+        // Use only the image slot. Setting state to .on also draws a second check at the far
+        // left on macOS 26, even with showsStateColumn disabled. Announce the value in the label.
+        let autoItem = action("Detect Meetings", #selector(toggleAutoRecord), symbol: controller.autoRecordEnabled ? "checkmark" : nil)
+        autoItem.setAccessibilityLabel(controller.autoRecordEnabled ? "Detect Meetings, on" : "Detect Meetings, off")
         menu.addItem(autoItem)
 
+        // Keep the icon-bearing app commands separate so they do not indent detection when off.
         menu.addItem(.separator())
-        menu.addItem(action("Quit Meeting2", #selector(quit), key: "q", mask: [.command]))
+        menu.addItem(action("Settings…", #selector(openSettings), key: ",", mask: [.command]))
+        menu.addItem(action("Quit Meeting2", #selector(quit), key: "q", mask: [.command], symbol: "power"))
     }
 
     /// A dimmed, non-interactive status line. `isEnabled = false` (with autoenablesItems
@@ -433,24 +443,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         _ selector: Selector,
         key: String = "",
         mask: NSEvent.ModifierFlags = [],
-        bulletColor: NSColor? = nil,
-        bulletGlyph: String = "●"
+        symbol: String? = nil,
+        color: NSColor? = nil
     ) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: selector, keyEquivalent: key)
         item.target = self
         if !key.isEmpty { item.keyEquivalentModifierMask = mask }
-        if let bulletColor {
-            // Unlike the header, this row is enabled, so keep the label in the normal
-            // label colour (only the glyph is tinted) and let AppKit handle highlighting.
-            let attributed = NSMutableAttributedString(
-                string: "\(bulletGlyph) ",
-                attributes: [.foregroundColor: bulletColor]
-            )
-            attributed.append(NSAttributedString(
-                string: title,
-                attributes: [.foregroundColor: NSColor.labelColor]
-            ))
-            item.attributedTitle = attributed
+        if let symbol {
+            let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            if let color {
+                item.image = image?.withSymbolConfiguration(.init(paletteColors: [color]))
+                item.image?.isTemplate = false
+            } else {
+                item.image = image
+            }
         }
         return item
     }
@@ -466,6 +472,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func openRecordingsFolder() { controller.openRecordingsFolder() }
     @objc private func transcribePending() { controller.transcribePendingRecordings() }
     @objc private func toggleAutoRecord() { controller.toggleAutoRecord() }
+    @objc private func openSettings() { controller.openSettings() }
+    @objc private func stopAndDisableAutoRecording() { controller.stopAndDisableAutoRecording() }
     @objc private func quit() { controller.quit() }
 
     @objc private func dismissAttentionItem(_ sender: NSMenuItem) {

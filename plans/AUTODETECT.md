@@ -10,6 +10,8 @@ disagree, **§6 wins**. Auto-detect is a *new trigger* that drives the same reco
 menu does, plus a keep/discard decision after the fact. The capture path, file-as-database model,
 and post-recording pipeline are unchanged.
 
+The next combined implementation is described in [AUTODETECT-APPS.md](AUTODETECT-APPS.md): searchable per-app controls and detector fixes for non-default microphones, idle polling, read failures, recording identity, and restart prevention after a stop. Its detector rules update the idle/recording behavior described below; these changes do not require separate P1/P2 releases.
+
 ## Scope: online (app-mediated) meetings only
 
 The signal is **"some app opened the microphone."** That happens for online calls — Zoom, Teams,
