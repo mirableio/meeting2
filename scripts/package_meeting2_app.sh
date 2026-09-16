@@ -6,10 +6,6 @@ set -euo pipefail
 # identity and code signature; manual recording must be tested through this app.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="${CONFIG:-debug}"
-BINARY="$ROOT/.build/arm64-apple-macosx/$CONFIG/Meeting2"
-if [[ ! -x "$BINARY" ]]; then
-    BINARY="$ROOT/.build/$CONFIG/Meeting2"
-fi
 
 APP="$ROOT/.build/$CONFIG/Meeting2.app"
 CONTENTS="$APP/Contents"
@@ -18,6 +14,9 @@ INFO="$CONTENTS/Info.plist"
 
 cd "$ROOT"
 swift build ${CONFIG:+--configuration "$CONFIG"} --product Meeting2
+# Ask the active toolchain after building: a hardcoded architecture directory can retain an old
+# executable when SwiftPM changes its output layout, silently packaging stale code after success.
+BINARY="$(swift build --configuration "$CONFIG" --show-bin-path)/Meeting2"
 
 rm -rf "$APP"
 mkdir -p "$MACOS"

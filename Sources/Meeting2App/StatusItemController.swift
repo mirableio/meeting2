@@ -457,6 +457,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             } else {
                 item.image = image
             }
+            // macOS 27 hides symbol menu images by default. Preserve the icons we explicitly
+            // chose, including recording controls and the detection-state indicator.
+            if #available(macOS 27.0, *) {
+                item.preferredImageVisibility = .visible
+            }
         }
         return item
     }

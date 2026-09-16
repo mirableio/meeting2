@@ -6,7 +6,6 @@ set -euo pipefail
 # can own stable TCC grants while still keeping the spike fast to rebuild.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="${CONFIG:-debug}"
-BINARY="$ROOT/.build/arm64-apple-macosx/$CONFIG/CaptureHarness"
 APP="$ROOT/.build/$CONFIG/CaptureHarness.app"
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
@@ -14,6 +13,8 @@ INFO="$CONTENTS/Info.plist"
 
 cd "$ROOT"
 swift build ${CONFIG:+--configuration "$CONFIG"}
+# Use this build's output directory, never an executable left by an earlier SwiftPM toolchain.
+BINARY="$(swift build --configuration "$CONFIG" --show-bin-path)/CaptureHarness"
 
 # System-audio capture is TCC-gated as an app capability, not just as a raw
 # executable capability. The harness must therefore run inside a signed .app with
