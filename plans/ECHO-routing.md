@@ -52,10 +52,7 @@ transcription; the remote is intelligible via bleed.
    `isLoudspeaker` — **conservatively**: only the Mac's own built-in speakers count
    (built-in transport, not the headphone jack). The route is stored in `meeting.json`
    (`outputRoute`) before the tap is created, so it survives clean stop and crash recovery.
-2. **Route-aware combined audio** (`CombinedAudioBuilder.build(includeSystemTrack:)`,
-   `CompressionJob`). `isLoudspeaker == true` ⇒ `audio.m4a` is the **mic on both channels**
-   (centered mono, no system, no drift correction). Otherwise unchanged (mic-L / system-R +
-   drift + limiter).
+2. **Route-aware combined audio** (`CombinedAudioBuilder.build(selection:)`, `CompressionJob`). Built-in speakers normally produce mic-only `audio.m4a` to avoid echo; other routes keep mic-left/system-right. If the mic recorded less than half as much audio as the system tap and the system has a known RMS of at least 0.005, compression instead centers the full system track. A gapped mic file has lost the timing of later samples, so combining it at its first timestamp can scramble the transcript. System-only output drops the direct mic channel, including local speech that survived; some of your voice may still appear as far-end echo. The reliable copy of the direct mic audio remains in `mic.m4a` for manual recovery. When system level is unknown or too low, the app keeps the surviving mic rather than replace it with mostly silence.
 3. **Per-track retention (the safety net).** Compression now re-encodes each raw CAF to a
    kept `mic.m4a` / `system.m4a` before deleting the CAFs. So the individual tracks are
    **always recoverable**, which is what makes the aggressive "drop the system track" choice
@@ -77,6 +74,7 @@ case is a suboptimal `audio.m4a` with both raw tracks still on disk.
 - **Acoustic (content-based) speaker/headphone detection.** Local bleed is incoherent
   (~−17 dB, MSC ~0), so "is the remote in the mic?" can't be measured reliably. Route
   detection is the dependable signal.
+- **Automatic placement of mic audio after capture gaps.** The current mic file stores samples consecutively without each buffer's position in the call. A stalled tap can now be warned about, but existing files cannot reveal where later mic samples belong. Future recordings could retain buffer timing and apply gaps during processing, away from the audio callback.
 
 ## Notes
 

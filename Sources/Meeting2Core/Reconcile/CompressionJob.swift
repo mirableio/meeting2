@@ -19,6 +19,9 @@ public struct MeetingCompressionResult: Equatable {
 }
 
 public struct CompressionJob {
+    // This is a conservative fallback, not speech detection: a notification peak can
+    // make `systemSilent` false even when almost the entire track is empty.
+    private static let minimumSystemRMSForFallback = 0.005
     private let audioBuilder: CombinedAudioBuilder
 
     public init(audioBuilder: CombinedAudioBuilder = CombinedAudioBuilder()) {
@@ -113,12 +116,39 @@ public struct CompressionJob {
         // merged file so transcription needs no offsets. Missing metadata ⇒ no skew known.
         let micOffset = metadata?.tracks.mic.startOffsetSeconds ?? 0
         let systemOffset = metadata?.tracks.system.startOffsetSeconds ?? 0
+        // File-length differences can mean missed callbacks after either route
+        // changed, not clock drift. Unknown recovery stats are not proof of continuity.
+        let allowDriftCorrection = metadata?.tracks.mic.routeChanges == 0
+            && metadata?.tracks.system.routeChanges == 0
 
-        // On a loudspeaker recording the mic already contains the whole conversation and the
-        // system track is just a delayed duplicate (echo), so the combined file is built
-        // from the mic alone. Anything else — headphones, external, or unknown route — keeps
-        // both tracks. The raw system audio is retained as system.m4a regardless.
-        let includeSystemTrack = metadata?.outputRoute?.isLoudspeaker != true
+        // Speakers normally favor mic-only to avoid echo. If the mic delivered less than
+        // half as much audio as the system tap, its file may contain collapsed gaps: the
+        // first timestamp cannot place later samples reliably. Use the complete system
+        // track alone rather than truncate the meeting or mix voices out of order. Never
+        // make that switch without a meaningful measured system level; crash recovery
+        // has no RMS and one stray notification can make `systemSilent` false. Both raw
+        // tracks are retained for a more informed manual recovery.
+        let selection: CombinedAudioBuilder.TrackSelection
+        if metadata?.outputRoute?.isLoudspeaker == true {
+            let micDuration = metadata?.tracks.mic.durationSeconds ?? 0
+            let systemDuration = metadata?.tracks.system.durationSeconds ?? 0
+            let systemRMS = metadata?.tracks.system.rms ?? 0
+            if systemDuration > 0,
+               metadata?.audioHealth.systemSilent != true,
+               systemRMS >= Self.minimumSystemRMSForFallback,
+               micDuration < systemDuration * 0.5 {
+                selection = .systemOnly
+                DebugDiagnostics.log(
+                    recordingFolder: micCAF.deletingLastPathComponent(),
+                    "incomplete mic: system-only audio micSeconds=\(micDuration) " +
+                    "systemSeconds=\(systemDuration) systemRMS=\(systemRMS)"
+                )
+            } else {
+                selection = .micOnly
+            }
+        } else {
+            selection = .both
+        }
 
         let temporaryURL = audioURL.deletingLastPathComponent()
             .appendingPathComponent("audio.\(UUID().uuidString).m4a")
@@ -131,7 +161,8 @@ public struct CompressionJob {
                 systemOffsetSeconds: systemOffset,
                 micPeak: metadata?.tracks.mic.peak,
                 systemPeak: metadata?.tracks.system.peak,
-                includeSystemTrack: includeSystemTrack
+                selection: selection,
+                allowDriftCorrection: allowDriftCorrection
             )
             try Self.validateAudioFile(temporaryURL)
             try fileManager.moveItem(at: temporaryURL, to: audioURL)

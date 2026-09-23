@@ -2,15 +2,20 @@ import AVFoundation
 import Foundation
 
 public struct CombinedAudioBuilder {
+    public enum TrackSelection {
+        case both
+        case micOnly
+        case systemOnly
+    }
+
     private let frameCapacity: AVAudioFrameCount = 4096
     private let bitRate = 128_000
 
     public init() {}
 
-    /// Merges the two raw mono tracks into one durable stereo `.m4a`: the local mic on the
-    /// left channel, system audio (everyone else) on the right. This is the single file a
-    /// person plays back later *and* the single file the transcriber receives — keeping the
-    /// channels split preserves speaker separation (you vs. them) without any real-time
+    /// Produces one durable stereo `.m4a` for playback and transcription. Normally the
+    /// local mic is left and system audio is right; a selected sole track is centered.
+    /// Keeping the normal tracks split preserves speaker separation without real-time
     /// mixing.
     ///
     /// The two tracks never start at the same instant (the system tap spins up before the
@@ -30,7 +35,8 @@ public struct CombinedAudioBuilder {
         systemOffsetSeconds: Double,
         micPeak: Float? = nil,
         systemPeak: Float? = nil,
-        includeSystemTrack: Bool = true
+        selection: TrackSelection = .both,
+        allowDriftCorrection: Bool = true
     ) throws {
         let micFile = try openReadableTrack(micURL, role: "mic")
         var systemFile = try openReadableTrack(systemURL, role: "system")
@@ -38,21 +44,35 @@ public struct CombinedAudioBuilder {
             throw CaptureError.conversionFailed("Cannot build combined audio: both tracks missing or empty")
         }
 
-        // Loudspeaker recordings: the mic already holds the whole conversation (your voice
-        // directly + the remote bleeding back from the speakers), while the system track
-        // only adds a time-delayed duplicate of that audio — the echo. When asked to drop
-        // it, and we actually have a mic to stand on, emit a mic-only file. The raw system
-        // audio is still preserved separately by the caller (system.m4a), so this choice is
-        // reversible. See plans/ECHO-routing.md.
-        if !includeSystemTrack, let micFile {
-            try buildMicOnly(
-                micURL: micURL,
-                micFile: micFile,
-                destinationURL: destinationURL,
-                micOffsetSeconds: micOffsetSeconds,
-                micPeak: micPeak
-            )
-            return
+        // A single selected track is centered for playback. If that track is missing,
+        // fall through to the surviving source instead of producing an empty file.
+        switch selection {
+        case .micOnly:
+            if let micFile {
+                try buildSingleTrack(
+                    trackURL: micURL,
+                    trackFile: micFile,
+                    role: "mic",
+                    destinationURL: destinationURL,
+                    offsetSeconds: micOffsetSeconds,
+                    peak: micPeak
+                )
+                return
+            }
+        case .systemOnly:
+            if let systemFile {
+                try buildSingleTrack(
+                    trackURL: systemURL,
+                    trackFile: systemFile,
+                    role: "system",
+                    destinationURL: destinationURL,
+                    offsetSeconds: systemOffsetSeconds,
+                    peak: systemPeak
+                )
+                return
+            }
+        case .both:
+            break
         }
 
         let sampleRate = AudioFormat.sampleRate
@@ -63,12 +83,14 @@ public struct CombinedAudioBuilder {
         // over a long meeting the same sound drifts to progressively different sample offsets —
         // which plays back as echo. We treat the mic as the reference timeline and resample the
         // system track (using its exact frame count, no estimation) so its content ends where the
-        // mic's does, keeping shared content aligned throughout. Only when both tracks exist — a
-        // lone track has nothing to align to. This is the resampler-sync follow-up from
+        // mic's does, keeping shared content aligned throughout. A capture interruption
+        // shortens a track too, so the caller disables this when route changes were
+        // observed. Only when both tracks exist — a lone track has nothing to align to.
+        // This is the resampler-sync follow-up from
         // plans/INIT.md §5.4.
         var driftTempURL: URL?
         defer { driftTempURL.map { try? FileManager.default.removeItem(at: $0) } }
-        if let mic = micFile, let system = systemFile {
+        if allowDriftCorrection, let mic = micFile, let system = systemFile {
             let targetSystemFrames = (micOffsetFrames + mic.length) - systemOffsetFrames
             if let corrected = try driftCorrectedSystemTrack(
                 systemURL: systemURL,
@@ -178,21 +200,20 @@ public struct CombinedAudioBuilder {
         }
     }
 
-    /// Writes a mic-only deliverable: the mic on *both* channels (so it plays centered, and
-    /// the file stays the same 2-channel shape everything downstream expects), no system
-    /// track, no drift correction (there is nothing to align to). The same peak limiter as
-    /// the combined path is applied so a hot mic doesn't clip.
-    private func buildMicOnly(
-        micURL: URL,
-        micFile: AVAudioFile,
+    /// A sole surviving or selected track is duplicated to both channels. This keeps
+    /// playback centered and the transcriber's input shape consistent.
+    private func buildSingleTrack(
+        trackURL: URL,
+        trackFile: AVAudioFile,
+        role: String,
         destinationURL: URL,
-        micOffsetSeconds: Double,
-        micPeak: Float?
+        offsetSeconds: Double,
+        peak: Float?
     ) throws {
-        let micOffsetFrames = max(0, AVAudioFramePosition((micOffsetSeconds * AudioFormat.sampleRate).rounded()))
-        let totalFrames = micOffsetFrames + micFile.length
+        let offsetFrames = max(0, AVAudioFramePosition((offsetSeconds * AudioFormat.sampleRate).rounded()))
+        let totalFrames = offsetFrames + trackFile.length
         guard totalFrames > 0 else {
-            throw CaptureError.conversionFailed("Cannot build mic-only audio from an empty mic track")
+            throw CaptureError.conversionFailed("Cannot build single-track audio from an empty track")
         }
 
         try FileManager.default.createDirectory(
@@ -201,17 +222,16 @@ public struct CombinedAudioBuilder {
         )
         try? FileManager.default.removeItem(at: destinationURL)
 
-        // A second independent handle for the right channel: the two `copy` calls each set
-        // `framePosition` before reading, so sharing one handle would make them fight.
-        let micRight = try openReadableTrack(micURL, role: "mic")
+        // Each channel seeks independently while writing; they cannot share a handle.
+        let secondHandle = try openReadableTrack(trackURL, role: role)
         try writeStereoM4A(
-            micFile: micFile,
-            systemFile: micRight,
+            micFile: trackFile,
+            systemFile: secondHandle,
             destinationURL: destinationURL,
-            micOffsetFrames: micOffsetFrames,
-            systemOffsetFrames: micOffsetFrames,
+            micOffsetFrames: offsetFrames,
+            systemOffsetFrames: offsetFrames,
             totalFrames: totalFrames,
-            gain: Self.normalizationGain(micPeak: micPeak, systemPeak: nil)
+            gain: Self.normalizationGain(micPeak: peak, systemPeak: nil)
         )
 
         try validateStereoM4A(destinationURL)

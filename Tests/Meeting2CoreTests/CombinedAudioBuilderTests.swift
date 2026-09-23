@@ -117,7 +117,7 @@ final class CombinedAudioBuilderTests: XCTestCase {
             systemOffsetSeconds: 0,
             micPeak: 0.5,
             systemPeak: 0.9,
-            includeSystemTrack: false
+            selection: .micOnly
         )
 
         let (left, right) = try decodeStereo(destination)

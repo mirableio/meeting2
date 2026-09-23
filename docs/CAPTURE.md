@@ -173,6 +173,10 @@ which is an acceptable price for not going silent for the rest of the meeting.
 > it can be limited to the "aggregate died" case to avoid the small audio gap. Until we
 > know, rebuilding is the safe default.
 
+The microphone has a separate route: changing the default input can stop and uninitialize `AVAudioEngine` even while system capture continues. `MicCapture` handles its configuration-change notification off the notification queue, refreshes the input format and converter, reinstalls the tap, and resumes writing the same `mic.caf`. If the device is still settling, it retries after one second and once more five seconds later. Notifications during those waits share the scheduled attempt; after three failures, a short cooldown prevents a restart loop. The missing interval is not padded into the raw file; debug builds log gaps over one second when input resumes.
+
+Both tracks record disruptive route changes in `meeting.json`. Compression skips whole-file drift correction when either track changed route, because a missing interval cannot safely be treated as clock drift. The raw files still retain the captured samples; placing mic audio on the original meeting timeline remains separate work.
+
 ### Silent recordings (the file looks fine but contains nothing)
 
 The nastiest failure is a recording that *looks* complete but is silent — a dead tap, a

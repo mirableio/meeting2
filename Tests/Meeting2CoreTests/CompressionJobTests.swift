@@ -131,6 +131,125 @@ final class CompressionJobTests: XCTestCase {
         XCTAssertLessThan(maxDelta, 0.02, "mic-only output channels differ (system leaked?)")
     }
 
+    func testLoudspeakerWithIncompleteMicKeepsFullSystemAudio() async throws {
+        let folder = root.appendingPathComponent("2026-06-09 15-00-00 — Incomplete mic")
+        let store = MeetingStore(root: root)
+        _ = try await store.markRecordingStarted(
+            folder: folder,
+            startedAt: Date(timeIntervalSince1970: 0),
+            outputRoute: OutputRoute(transport: "BuiltIn", isLoudspeaker: true)
+        )
+        try writeCAF(folder.appendingPathComponent("mic.caf"), frameCount: 9_600)
+        try writeCAF(folder.appendingPathComponent("system.caf"), divisor: 7, frameCount: 48_000)
+        var metadata = try await store.finalizeCompletedRecording(folder: folder, stats: nil)
+        metadata.tracks.system.rms = 0.7
+        metadata.audioHealth.systemSilent = false
+        try AtomicJSON.write(metadata, to: MeetingStore.metadataURL(in: folder))
+
+        _ = try await CompressionJob().perform(folder: folder, store: store)
+
+        let audioURL = folder.appendingPathComponent("audio.m4a")
+        let (left, right) = try decodeStereo(audioURL)
+        XCTAssertGreaterThanOrEqual(left.count, 48_000)
+        XCTAssertEqual(left.count, right.count)
+        // The late part of *both* channels must carry system audio. Mic-only would
+        // end at 0.2 s; keeping a misaligned mic on the left would leave it empty here.
+        let late = left[24_000..<40_000]
+        let lateRMS = sqrt(late.reduce(Float(0)) { $0 + $1 * $1 } / Float(late.count))
+        XCTAssertGreaterThan(lateRMS, 0.2)
+        let maxDelta = zip(left, right).map { abs($0 - $1) }.max() ?? 0
+        XCTAssertLessThan(maxDelta, 0.02)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("mic.m4a").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("system.m4a").path))
+    }
+
+    func testLoudspeakerWithSilentSystemKeepsSurvivingMic() async throws {
+        let folder = root.appendingPathComponent("2026-06-09 15-01-00 — Silent system")
+        let store = MeetingStore(root: root)
+        _ = try await store.markRecordingStarted(
+            folder: folder,
+            startedAt: Date(timeIntervalSince1970: 0),
+            outputRoute: OutputRoute(transport: "BuiltIn", isLoudspeaker: true)
+        )
+        try writeCAF(folder.appendingPathComponent("mic.caf"), frameCount: 9_600)
+        try writeCAF(folder.appendingPathComponent("system.caf"), frameCount: 48_000, amplitude: 0)
+        var metadata = try await store.finalizeCompletedRecording(folder: folder, stats: nil)
+        metadata.audioHealth.systemSilent = true
+        try AtomicJSON.write(metadata, to: MeetingStore.metadataURL(in: folder))
+
+        _ = try await CompressionJob().perform(folder: folder, store: store)
+
+        let (left, right) = try decodeStereo(folder.appendingPathComponent("audio.m4a"))
+        XCTAssertLessThan(left.count, 20_000)
+        XCTAssertEqual(left.count, right.count)
+        let peak = left.map(abs).max() ?? 0
+        XCTAssertGreaterThan(peak, 0.5)
+    }
+
+    func testLoudspeakerWithUnknownSystemLevelKeepsSurvivingMic() async throws {
+        let folder = root.appendingPathComponent("2026-06-09 15-02-00 — Recovered")
+        let store = MeetingStore(root: root)
+        _ = try await store.markRecordingStarted(
+            folder: folder,
+            startedAt: Date(timeIntervalSince1970: 0),
+            outputRoute: OutputRoute(transport: "BuiltIn", isLoudspeaker: true)
+        )
+        try writeCAF(folder.appendingPathComponent("mic.caf"), frameCount: 9_600)
+        try writeCAF(folder.appendingPathComponent("system.caf"), divisor: 7, frameCount: 48_000)
+        _ = try await store.finalizeCompletedRecording(folder: folder, stats: nil)
+
+        _ = try await CompressionJob().perform(folder: folder, store: store)
+
+        let (left, _) = try decodeStereo(folder.appendingPathComponent("audio.m4a"))
+        XCTAssertLessThan(left.count, 20_000)
+        XCTAssertGreaterThan(left.map(abs).max() ?? 0, 0.5)
+    }
+
+    func testLoudspeakerWithSparseSystemSoundKeepsSurvivingMic() async throws {
+        let folder = root.appendingPathComponent("2026-06-09 15-03-00 — Sparse system")
+        let store = MeetingStore(root: root)
+        _ = try await store.markRecordingStarted(
+            folder: folder,
+            startedAt: Date(timeIntervalSince1970: 0),
+            outputRoute: OutputRoute(transport: "BuiltIn", isLoudspeaker: true)
+        )
+        try writeCAF(folder.appendingPathComponent("mic.caf"), frameCount: 9_600)
+        try writeCAF(folder.appendingPathComponent("system.caf"), divisor: 7, frameCount: 48_000, activeFrames: 5)
+        var metadata = try await store.finalizeCompletedRecording(folder: folder, stats: nil)
+        metadata.tracks.system.rms = 0.0035
+        metadata.tracks.system.peak = 0.54
+        metadata.audioHealth.systemSilent = false
+        try AtomicJSON.write(metadata, to: MeetingStore.metadataURL(in: folder))
+
+        _ = try await CompressionJob().perform(folder: folder, store: store)
+
+        let (left, _) = try decodeStereo(folder.appendingPathComponent("audio.m4a"))
+        XCTAssertLessThan(left.count, 20_000)
+        XCTAssertGreaterThan(left.map(abs).max() ?? 0, 0.5)
+    }
+
+    func testRouteChangeDoesNotStretchSystemAudioAsClockDrift() async throws {
+        let store = MeetingStore(root: root)
+
+        func compressedLength(micRouteChanges: Int) async throws -> AVAudioFramePosition {
+            let folder = root.appendingPathComponent("route-changes-\(micRouteChanges)")
+            _ = try await store.markRecordingStarted(folder: folder, startedAt: Date(timeIntervalSince1970: 0))
+            try writeCAF(folder.appendingPathComponent("mic.caf"), frameCount: 48_000)
+            try writeCAF(folder.appendingPathComponent("system.caf"), frameCount: 48_384)
+            var metadata = try await store.finalizeCompletedRecording(folder: folder, stats: nil)
+            metadata.tracks.mic.routeChanges = micRouteChanges
+            metadata.tracks.system.routeChanges = 0
+            try AtomicJSON.write(metadata, to: MeetingStore.metadataURL(in: folder))
+
+            _ = try await CompressionJob().perform(folder: folder, store: store)
+            return try AVAudioFile(forReading: folder.appendingPathComponent("audio.m4a")).length
+        }
+
+        let corrected = try await compressedLength(micRouteChanges: 0)
+        let unchanged = try await compressedLength(micRouteChanges: 1)
+        XCTAssertGreaterThan(unchanged, corrected + 250)
+    }
+
     func testRunPendingIsolatesPerItemFailure() async throws {
         let store = MeetingStore(root: root)
         let job = CompressionJob()
@@ -194,7 +313,13 @@ final class CompressionJobTests: XCTestCase {
         )
     }
 
-    private func writeCAF(_ url: URL, divisor: Float = 24) throws {
+    private func writeCAF(
+        _ url: URL,
+        divisor: Float = 24,
+        frameCount: AVAudioFrameCount = 9_600,
+        amplitude: Float = 1,
+        activeFrames: Int? = nil
+    ) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let format = AudioFormat.pcmFormat
         let file = try AVAudioFile(
@@ -204,7 +329,6 @@ final class CompressionJobTests: XCTestCase {
             interleaved: false
         )
 
-        let frameCount: AVAudioFrameCount = 9_600
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount),
               let channel = buffer.floatChannelData?.pointee else {
             XCTFail("Could not allocate CAF test buffer")
@@ -213,7 +337,9 @@ final class CompressionJobTests: XCTestCase {
 
         buffer.frameLength = frameCount
         for frame in 0..<Int(frameCount) {
-            channel[frame] = sin(Float(frame) / divisor)
+            channel[frame] = frame < (activeFrames ?? Int(frameCount))
+                ? amplitude * sin(Float(frame) / divisor)
+                : 0
         }
 
         try file.write(from: buffer)

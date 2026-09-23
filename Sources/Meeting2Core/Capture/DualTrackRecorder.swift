@@ -16,6 +16,9 @@ public struct TrackStats {
     /// `nil` means no audio was ever received. Comparing the mic's value to the
     /// system track's gives the offset needed to align the two files.
     public let hostStartTime: UInt64?
+    /// Monotonic time of the last successfully written buffer. Unlike RMS, this
+    /// distinguishes a quiet mic from a tap that stopped delivering samples.
+    public let lastBufferHostTime: UInt64?
     /// Recent loudness (fast-attack / slow-release), for live UI like the breathing
     /// menu-bar indicator. Not persisted — purely a live read while recording.
     public let recentLevel: Float
@@ -27,6 +30,7 @@ public struct TrackStats {
         droppedBytes: Int,
         routeChanges: Int = 0,
         hostStartTime: UInt64? = nil,
+        lastBufferHostTime: UInt64? = nil,
         recentLevel: Float = 0
     ) {
         self.url = url
@@ -35,6 +39,7 @@ public struct TrackStats {
         self.droppedBytes = droppedBytes
         self.routeChanges = routeChanges
         self.hostStartTime = hostStartTime
+        self.lastBufferHostTime = lastBufferHostTime
         self.recentLevel = recentLevel
     }
 

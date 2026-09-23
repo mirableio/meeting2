@@ -866,7 +866,7 @@ final class RecorderMenuController: ObservableObject, AutoRecordingCommands {
         // started or dropped mid-meeting. We use `recentLevel` (a decaying recent loudness)
         // with a grace, not cumulative `isSilent`: cumulative RMS never reads silent again
         // once any sound has occurred, so it would miss a mid-call drop. A short pause
-        // won't trip it; ~6 s of quiet will, and it clears the moment audio returns.
+        // won't trip it; the warning clears when audio returns.
         let systemQuiet = stats.system.hostStartTime == nil || stats.system.recentLevel < Self.liveSilenceLevel
         if systemQuiet {
             if systemSilentSince == nil { systemSilentSince = now }
@@ -875,14 +875,15 @@ final class RecorderMenuController: ObservableObject, AutoRecordingCommands {
         }
         let systemBad = systemSilentSince.map { now.timeIntervalSince($0) >= Self.systemSilenceGraceSeconds } ?? false
 
-        // Mic: only flag it if it has produced *no* audio at all past a long grace — a quiet
-        // mic mid-call is normal (you're listening or muted), so we never re-flag once it
-        // has had real audio. Both silent at once is the loudest, unambiguous case.
+        // A quiet mic is normal mid-call, but a tap that stops writing buffers is not.
+        // The old cumulative "ever had audio" check stayed healthy forever after one
+        // good buffer, even when the tap then stopped for most of a meeting.
         if stats.mic.hostStartTime != nil, !stats.mic.isSilent {
             micEverHadAudio = true
         }
         let elapsed = recordingStartedAt.map { now.timeIntervalSince($0) } ?? 0
-        let micBad = !micEverHadAudio && elapsed > Self.micSilenceGraceSeconds
+        let micStalled = micBuffersStalled(stats.mic, now: now)
+        let micBad = micStalled || (!micEverHadAudio && elapsed > Self.micSilenceGraceSeconds)
 
         let warning: LiveAudioWarning
         if systemBad, micBad {
@@ -900,8 +901,17 @@ final class RecorderMenuController: ObservableObject, AutoRecordingCommands {
         DebugDiagnostics.log(
             recordingFolder: folder,
             "live audio warning=\(warning.rawValue) micEverHadAudio=\(micEverHadAudio) " +
+            "micBuffersStalled=\(micStalled) " +
             "systemRMS=\(stats.system.rms) micRMS=\(stats.mic.rms)"
         )
+    }
+
+    private func micBuffersStalled(_ stats: TrackStats, now: Date) -> Bool {
+        if let last = stats.lastBufferHostTime {
+            return HostClock.milliseconds(from: last, to: mach_absolute_time()) >=
+                Self.micSilenceGraceSeconds * 1_000
+        }
+        return recordingStartedAt.map { now.timeIntervalSince($0) >= Self.micSilenceGraceSeconds } ?? false
     }
 
     // MARK: - "Forgot to stop" supervision
@@ -926,14 +936,21 @@ final class RecorderMenuController: ObservableObject, AutoRecordingCommands {
 
         // Both tracks quiet *right now* (recent loudness, not cumulative); any real sound on either
         // resets the timer, so this needs a continuous silent stretch, not just a quiet average.
-        let bothQuiet = stats.mic.recentLevel < Self.liveSilenceLevel
+        // `recentLevel` decays only when buffers arrive; a stopped mic tap otherwise
+        // leaves its last loud value stuck and can block the 15-minute silence stop.
+        let micStalled = micBuffersStalled(stats.mic, now: now)
+        let bothQuiet = (micStalled || stats.mic.recentLevel < Self.liveSilenceLevel)
             && stats.system.recentLevel < Self.liveSilenceLevel
         if bothQuiet {
             let since = bothSilentSince ?? now
             bothSilentSince = since
             if now.timeIntervalSince(since) >= Self.bothSilentStopSeconds {
-                DebugDiagnostics.log(recordingFolder: folder, "auto-stop: 15 min of silence")
-                notifyLeftRunning("Recording stopped after 15 minutes of silence.")
+                DebugDiagnostics.log(recordingFolder: folder, "auto-stop: 15 min without audio micBuffersStalled=\(micStalled)")
+                notifyLeftRunning(
+                    micStalled
+                        ? "Recording stopped: microphone stopped delivering audio, and no call audio was detected for 15 minutes."
+                        : "Recording stopped after 15 minutes of silence."
+                )
                 stopRecording(reason: .silenceLimit)
             }
         } else {
