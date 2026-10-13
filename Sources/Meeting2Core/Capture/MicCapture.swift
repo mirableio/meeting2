@@ -1,6 +1,7 @@
 import AVFoundation
 import Darwin
 import Foundation
+import Meeting2AudioSupport
 import TPCircularBuffer
 
 private final class HostTimeAtomicCell {
@@ -154,9 +155,9 @@ final class MicCapture {
             )
             self.recoveryQueue.async { [weak self] in self?.restartAfterConfigurationChange() }
         }
-        installTap(format: sourceFormat, converter: converter, file: file)
-        engineStartRequestedHostTime = mach_absolute_time()
         do {
+            try installTap(format: sourceFormat, converter: converter, file: file)
+            engineStartRequestedHostTime = mach_absolute_time()
             try engine.start()
         } catch {
             // The tap and file already exist even if the engine never reached running.
@@ -227,9 +228,11 @@ final class MicCapture {
             hasInstalledTap = false
         }
         do {
-            let format = input.outputFormat(forBus: 0)
+            // The output bus can retain the old tap's format after a hardware change.
+            // The input bus describes the current device; use it to rebind the tap.
+            let format = input.inputFormat(forBus: 0)
             let converter = try Self.makeConverter(from: format)
-            installTap(format: format, converter: converter, file: file)
+            try installTap(format: format, converter: converter, file: file)
             try engine.start()
             recoveryRetryState.reset()
             DebugDiagnostics.log(
@@ -269,10 +272,14 @@ final class MicCapture {
         return converter
     }
 
-    private func installTap(format: AVAudioFormat, converter: AVAudioConverter?, file: AVAudioFile) {
+    private func installTap(format: AVAudioFormat, converter: AVAudioConverter?, file: AVAudioFile) throws {
         // Capture format-specific objects in the tap closure. A route rebuild replaces
         // them without racing a callback already finishing on the previous format.
-        engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, time in
+        // A settling route can raise an Objective-C exception here, which Swift's
+        // catch would miss. The narrow bridge turns it into an ordinary retryable error.
+        try Meeting2AudioTapInstaller.install(
+            on: engine.inputNode, bus: 0, bufferSize: 4096, format: format
+        ) { [weak self] buffer, time in
             self?.handle(buffer, time: time, sourceFormat: format, converter: converter, file: file)
         }
         hasInstalledTap = true

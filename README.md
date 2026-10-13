@@ -1,6 +1,6 @@
 # Meeting2
 
-A quiet macOS menu-bar app that records your meetings **locally** and transcribes them — without joining the call as a bot, without a virtual microphone, without an account, and without sending anything to the cloud unless you choose to turn on transcription.
+A quiet macOS menu-bar app that records your meetings **locally** and transcribes them — without joining the call as a bot, without a virtual microphone, without an account, and without sending anything to the cloud unless you enable transcription or run a transcript backup.
 
 It captures two things while you're in a call: **your microphone** (you) and **the sound your Mac is playing** (everyone else). Both are saved straight to a folder on your disk that you can open in Finder. After the meeting, it can transcribe the recording with Google Gemini, labelled by speaker.
 
@@ -106,6 +106,26 @@ You can rename the folder, move it, delete it, or play `audio.m4a` in any audio 
 
 ---
 
+## Back up transcripts to iCloud
+
+Run this from the project folder:
+
+```sh
+make dev-backup-transcripts
+```
+
+This copies `transcript.md`, `transcript.json`, and `meeting.json` into **iCloud Drive / Meeting2**, preserving each meeting's folder name. Audio and logs are excluded. Rerunning copies new or changed files; locally deleted meetings remain in the backup. Changed files replace their previous backup, so this does not keep a version history.
+
+Preview with `make dev-backup-transcripts DRY_RUN=1`. To use another location, set `TRANSCRIPT_BACKUP_ROOT`, for example:
+
+```sh
+make dev-backup-transcripts TRANSCRIPT_BACKUP_ROOT="/Volumes/Backup/Meeting2"
+```
+
+The command finishes after the local copy. macOS uploads iCloud Drive files asynchronously; Finder shows their sync status.
+
+---
+
 ## Turn on transcription (optional)
 
 Transcription uses **Google Gemini**. To enable it:
@@ -128,8 +148,8 @@ The transcript marks who's speaking (your mic vs. the call), in the language spo
 ## Privacy
 
 - **Recording and storage are 100% local.** Audio is captured on your Mac and written straight to your disk. Nothing is sent anywhere to record or to save.
-- **Transcription is the only thing that uses the internet**, and only if you set up an API key. When it runs, the meeting's audio is uploaded to Google's Gemini service, transcribed, and the uploaded copy is then **deleted from Google**. The transcript is saved back into your local folder.
-- **No account, no telemetry, no cloud sync.** If you never set an API key, your audio never leaves your Mac.
+- **Transcription uses the internet only if you set up an API key.** When it runs, the meeting's audio is uploaded to Google's Gemini service, transcribed, and the uploaded copy is then **deleted from Google**. The transcript is saved back into your local folder.
+- **No account, no telemetry, no automatic cloud sync.** The optional manual backup command copies transcripts and metadata into iCloud Drive for macOS to upload. It excludes audio.
 
 A note on consent: this app records both sides of a call. Recording conversations has legal and courtesy implications in some places — make sure the people you're meeting with are okay with being recorded.
 

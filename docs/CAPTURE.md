@@ -168,12 +168,14 @@ preserve the original "first sample" timestamp across the rebuild so the two fil
 line up. The cost is a fraction of a second of system audio missed during the switch,
 which is an acceptable price for not going silent for the rest of the meeting.
 
+Bluetooth call mode can change the sample rate while the output device stays the same. Capture sets the private aggregate's clock to the physical output device's current rate and then reads its virtual input-stream format, rather than trusting the standalone tap's advertised rate. Both descriptions must agree before capture starts. Format and clock listeners watch the physical output as well as the aggregate, since the aggregate can keep its old rate after the output changes. A 24 kHz input is converted to the fixed 48 kHz file format; labeling it as 48 kHz without conversion would double playback speed. Debug logs record the tap, capture and output rates so a mismatch can be diagnosed.
+
 > Open question the spike is meant to answer: a *global* tap might keep working across an
 > output change without a rebuild. If hardware testing shows the rebuild is unnecessary,
 > it can be limited to the "aggregate died" case to avoid the small audio gap. Until we
 > know, rebuilding is the safe default.
 
-The microphone has a separate route: changing the default input can stop and uninitialize `AVAudioEngine` even while system capture continues. `MicCapture` handles its configuration-change notification off the notification queue, refreshes the input format and converter, reinstalls the tap, and resumes writing the same `mic.caf`. If the device is still settling, it retries after one second and once more five seconds later. Notifications during those waits share the scheduled attempt; after three failures, a short cooldown prevents a restart loop. The missing interval is not padded into the raw file; debug builds log gaps over one second when input resumes.
+The microphone has a separate route: changing the default input can stop and uninitialize `AVAudioEngine` even while system capture continues. `MicCapture` handles its configuration-change notification off the notification queue, reads the current hardware input format rather than the old tap's output format, refreshes the converter, reinstalls the tap, and resumes writing the same `mic.caf`. A small Objective-C wrapper turns tap-installation exceptions into ordinary errors; Swift's `catch` alone cannot handle those exceptions. If the device is still settling, it retries after one second and once more five seconds later. Notifications during those waits share the scheduled attempt; after three failures, a short cooldown prevents a restart loop. The missing interval is not padded into the raw file; debug builds log gaps over one second when input resumes.
 
 Both tracks record disruptive route changes in `meeting.json`. Compression skips whole-file drift correction when either track changed route, because a missing interval cannot safely be treated as clock drift. The raw files still retain the captured samples; placing mic audio on the original meeting timeline remains separate work.
 

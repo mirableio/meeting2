@@ -66,11 +66,12 @@ enum AudioObjectReader {
     /// first, then read that many `AudioObjectID`s.
     static func readAudioObjectIDList(
         _ objectID: AudioObjectID,
-        selector: AudioObjectPropertySelector
+        selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal
     ) throws -> [AudioObjectID] {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
+            mScope: scope,
             mElement: kAudioObjectPropertyElementMain
         )
         var size: UInt32 = 0

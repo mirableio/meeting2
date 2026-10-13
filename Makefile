@@ -27,6 +27,8 @@ TRANSCRIPTION_ROOT ?= $(RECORDING)
 TRANSCRIPTION_ENV ?= $(CURDIR)/.env
 TRANSCRIPTION_MODEL ?= $(GEMINI_MODEL)
 RECORDINGS_ROOT ?= $(HOME)/Recordings/Meetings
+# Empty uses the script's iCloud default and availability check.
+TRANSCRIPT_BACKUP_ROOT ?=
 TRASH_ROOT ?= $(HOME)/.Trash
 DRY_RUN ?= 0
 APPLICATIONS_DIR ?= /Applications
@@ -40,7 +42,7 @@ RECOVERY_TOOL := .build/$(CONFIG)/MeetingRecoveryTool
 COMPRESSION_TOOL := .build/$(CONFIG)/MeetingCompressionTool
 TRANSCRIPTION_TOOL := .build/$(CONFIG)/MeetingTranscriptionTool
 
-.PHONY: build dev-test dev-package dev-package-app dev-open-app dev-link-app dev-audio-devices dev-smoke dev-smoke-system dev-smoke-crash dev-smoke-route dev-smoke-route-auto dev-smoke-align dev-recover dev-compress dev-combine-stereo dev-transcribe dev-transcribe-fixture dev-clean-retained-tracks dev-clean
+.PHONY: build dev-test dev-package dev-package-app dev-open-app dev-link-app dev-audio-devices dev-smoke dev-smoke-system dev-smoke-crash dev-smoke-route dev-smoke-route-auto dev-smoke-align dev-recover dev-compress dev-combine-stereo dev-transcribe dev-transcribe-fixture dev-backup-transcripts dev-clean-retained-tracks dev-clean
 
 build:
 	swift build --configuration $(CONFIG)
@@ -160,6 +162,10 @@ dev-combine-stereo:
 
 dev-transcribe-fixture:
 	STEREO_FILE="$(STEREO_FILE)" GEMINI_OUTPUT_DIR="$(GEMINI_OUTPUT_DIR)" GEMINI_MODEL="$(GEMINI_MODEL)" scripts/transcribe_gemini_fixture.sh
+
+# Manual, incremental transcript backup; no build or audio upload is involved.
+dev-backup-transcripts:
+	bash scripts/backup_transcripts.sh --root "$(RECORDINGS_ROOT)" $(if $(TRANSCRIPT_BACKUP_ROOT),--destination "$(TRANSCRIPT_BACKUP_ROOT)") $(if $(filter 1 true yes,$(DRY_RUN)),--dry-run)
 
 # Retained mic/system tracks are useful while debugging capture, but once audio.m4a
 # exists they are redundant for normal library use and can dominate disk usage. Move

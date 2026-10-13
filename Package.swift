@@ -28,9 +28,15 @@ let package = Package(
             path: "Sources/TPCircularBuffer",
             publicHeadersPath: "include"
         ),
+        // A narrow Objective-C boundary makes native tap exceptions catchable in Swift.
+        .target(
+            name: "Meeting2AudioSupport",
+            path: "Sources/Meeting2AudioSupport",
+            publicHeadersPath: "include"
+        ),
         .target(
             name: "Meeting2Core",
-            dependencies: ["TPCircularBuffer"],
+            dependencies: ["TPCircularBuffer", "Meeting2AudioSupport"],
             path: "Sources/Meeting2Core",
             linkerSettings: [
                 .linkedFramework("AVFoundation"),

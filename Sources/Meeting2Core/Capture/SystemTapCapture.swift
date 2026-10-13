@@ -13,6 +13,9 @@ private struct SystemTapIOProcContext {
 private struct SystemTapGraph {
     let tapID: AudioObjectID
     let aggregateID: AudioObjectID
+    let inputStreamID: AudioObjectID
+    let outputDeviceID: AudioObjectID
+    let outputStreamID: AudioObjectID
     let sourceFormat: AVAudioFormat
 }
 
@@ -103,6 +106,7 @@ final class SystemTapCapture {
     private var routeChangeCount = 0
     private var defaultOutputListener: AudioObjectPropertyListenerBlock?
     private var aggregateAliveListener: AudioObjectPropertyListenerBlock?
+    private var formatListeners: [(objectID: AudioObjectID, address: AudioObjectPropertyAddress, block: AudioObjectPropertyListenerBlock)] = []
     private var isRunning = false
     private var isRebuildingRoute = false
     private var pendingRouteRebuild = false
@@ -162,7 +166,7 @@ final class SystemTapCapture {
 
         let graph = try createTapGraph()
         installTapGraph(graph)
-        try registerRouteChangeListeners()
+        try registerRouteChangeListeners(graph: graph)
         DebugDiagnostics.log(recordingFolder: recordingFolder, "system tap route listeners registered")
         DebugDiagnostics.log(
             recordingFolder: recordingFolder,
@@ -293,24 +297,6 @@ final class SystemTapCapture {
             }
             DebugDiagnostics.log(recordingFolder: recordingFolder, "process tap created tapID=\(newTapID)")
 
-            var asbd = try readTapStreamDescriptionWithRetry(tapID: newTapID)
-            DebugDiagnostics.log(recordingFolder: recordingFolder, "process tap format \(asbd)")
-
-            guard let tapFormat = AVAudioFormat(streamDescription: &asbd) else {
-                throw CaptureError.unsupportedFormat("Could not build AVAudioFormat from tap stream description")
-            }
-
-            try Self.validateTapFormat(asbd, format: tapFormat)
-
-            guard let sourceFormat = AVAudioFormat(
-                commonFormat: .pcmFormatFloat32,
-                sampleRate: asbd.mSampleRate,
-                channels: AudioFormat.channelCount,
-                interleaved: false
-            ) else {
-                throw CaptureError.unsupportedFormat("Could not build normalized tap source format")
-            }
-
             let aggregateUID = "meetingrec-tap-\(UUID().uuidString)"
             let anchorUID = route.defaultOutput.uid
             let anchorSubDevice: [String: Any] = [
@@ -345,7 +331,40 @@ final class SystemTapCapture {
                 try setAggregateTapList(tapUID: tapUID, aggregateID: newAggregateID)
             }
 
-            return SystemTapGraph(tapID: newTapID, aggregateID: newAggregateID, sourceFormat: sourceFormat)
+            // A global tap defaults to 48 kHz, but the aggregate's main device can be
+            // on a 24 kHz Bluetooth call clock. Explicitly match that clock before
+            // reading the IOProc's virtual input format; tap metadata alone is not
+            // proof of the delivered rate. Never force the physical device to 48 kHz.
+            let outputStreams = try AudioObjectReader.readAudioObjectIDList(
+                route.defaultOutput.id, selector: kAudioDevicePropertyStreams, scope: kAudioDevicePropertyScopeOutput
+            )
+            guard let outputStreamID = outputStreams.first else {
+                throw CaptureError.unsupportedFormat("Default output device has no audio stream")
+            }
+            let outputRate = try readOutputSampleRate(streamID: outputStreamID)
+            var aggregateRate = outputRate
+            var rateAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyNominalSampleRate,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            try CaptureError.check(
+                AudioObjectSetPropertyData(newAggregateID, &rateAddress, 0, nil, UInt32(MemoryLayout<Float64>.size), &aggregateRate),
+                "AudioObjectSetPropertyData(aggregate sample rate)"
+            )
+            let tapDescription = try readTapStreamDescriptionWithRetry(tapID: newTapID)
+            let input = try readReadyAggregateInputFormat(aggregateID: newAggregateID, sampleRate: outputRate)
+            DebugDiagnostics.log(recordingFolder: recordingFolder, "process tap format \(tapDescription)")
+            DebugDiagnostics.log(
+                recordingFolder: recordingFolder,
+                "aggregate input format streamID=\(input.streamID) sampleRate=\(input.format.sampleRate) " +
+                "channels=\(input.format.channelCount) outputDeviceRate=\(outputRate)"
+            )
+            return SystemTapGraph(
+                tapID: newTapID, aggregateID: newAggregateID,
+                inputStreamID: input.streamID, outputDeviceID: route.defaultOutput.id,
+                outputStreamID: outputStreamID, sourceFormat: input.format
+            )
         } catch {
             destroyTapGraph(tapID: newTapID, aggregateID: newAggregateID)
             throw error
@@ -424,21 +443,72 @@ final class SystemTapCapture {
         throw lastError ?? CaptureError.invalidState("Could not read process tap stream description")
     }
 
-    private static func validateTapFormat(_ asbd: AudioStreamBasicDescription, format: AVAudioFormat) throws {
+    private static func validateInputFormat(_ asbd: AudioStreamBasicDescription) throws {
         let expectedBytesPerFrame = UInt32(MemoryLayout<Float>.stride)
 
         // The IOProc intentionally treats the tap buffer as raw Float32 bytes.
         // A mono packed buffer and a mono non-interleaved buffer have the same
         // memory layout, so the guard is on the actual byte contract and the
         // writer receives an explicit non-interleaved AVAudioFormat separately.
-        guard asbd.mFormatID == kAudioFormatLinearPCM,
+        guard asbd.mSampleRate.isFinite, asbd.mSampleRate > 0,
+              asbd.mFormatID == kAudioFormatLinearPCM,
               asbd.mBitsPerChannel == 32,
               asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0,
               asbd.mBytesPerFrame == expectedBytesPerFrame,
-              format.commonFormat == .pcmFormatFloat32,
-              format.channelCount == AudioFormat.channelCount else {
+              asbd.mChannelsPerFrame == AudioFormat.channelCount else {
             throw CaptureError.unsupportedFormat("Expected mono Float32 LPCM from process tap, got \(asbd)")
         }
+    }
+
+    private func readAggregateInputFormat(aggregateID: AudioObjectID) throws -> (streamID: AudioObjectID, format: AVAudioFormat) {
+        let streams = try AudioObjectReader.readAudioObjectIDList(
+            aggregateID, selector: kAudioDevicePropertyStreams, scope: kAudioDevicePropertyScopeInput
+        )
+        guard let streamID = streams.first else {
+            throw CaptureError.unsupportedFormat("Process tap aggregate has no input stream")
+        }
+        let description = try AudioObjectReader.readStreamDescription(streamID, selector: kAudioStreamPropertyVirtualFormat)
+        // Validate before constructing AVAudioFormat: settling devices can report
+        // zero rates/channels, which must be a recoverable error, not a native assertion.
+        try Self.validateInputFormat(description)
+        guard let normalized = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32, sampleRate: description.mSampleRate,
+            channels: AudioFormat.channelCount, interleaved: false
+        ) else {
+            throw CaptureError.unsupportedFormat("Could not normalize process tap aggregate input format")
+        }
+        return (streamID, normalized)
+    }
+
+    private func readOutputSampleRate(streamID: AudioObjectID) throws -> Float64 {
+        // Read the actual stream format, not just a device's cached nominal clock.
+        // Bluetooth call-mode transitions are published as stream-format changes.
+        let rate = try AudioObjectReader.readStreamDescription(streamID, selector: kAudioStreamPropertyVirtualFormat).mSampleRate
+        guard rate.isFinite, rate > 0 else {
+            throw CaptureError.unsupportedFormat("Output device has no usable sample rate")
+        }
+        return rate
+    }
+
+    private func readReadyAggregateInputFormat(
+        aggregateID: AudioObjectID, sampleRate: Float64
+    ) throws -> (streamID: AudioObjectID, format: AVAudioFormat) {
+        // HAL can publish the old virtual format briefly after accepting a new clock.
+        // Do not start consuming bytes until both descriptions agree.
+        var lastError: Error?
+        for attempt in 0..<5 {
+            do {
+                let input = try readAggregateInputFormat(aggregateID: aggregateID)
+                guard input.format.sampleRate == sampleRate else {
+                    throw CaptureError.unsupportedFormat("Aggregate input rate \(input.format.sampleRate) does not match output rate \(sampleRate)")
+                }
+                return input
+            } catch {
+                lastError = error
+                if attempt < 4 { Thread.sleep(forTimeInterval: 0.1) }
+            }
+        }
+        throw lastError ?? CaptureError.unsupportedFormat("Aggregate input format is not ready")
     }
 
     private func destroyTapGraph() {
@@ -582,9 +652,10 @@ final class SystemTapCapture {
         try CaptureError.check(status, "AudioObjectSetPropertyData(kAudioAggregateDevicePropertyTapList)")
     }
 
-    private func registerRouteChangeListeners() throws {
+    private func registerRouteChangeListeners(graph: SystemTapGraph) throws {
         try registerDefaultOutputListener()
         try registerAggregateAliveListener()
+        try registerFormatListeners(graph: graph)
     }
 
     private func registerDefaultOutputListener() throws {
@@ -617,8 +688,15 @@ final class SystemTapCapture {
             return
         }
 
+        let observedAggregateID = aggregateID
         let aggregateListener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.handleRouteChange(reason: "aggregate device liveness changed")
+            // Removing a listener cannot recall a notification already queued for
+            // the retired graph. Also, becoming alive after startup is not a failure.
+            // Either signal must not tear down a healthy replacement indefinitely.
+            guard let self, self.isRunning, self.aggregateID == observedAggregateID else { return }
+            let alive = try? AudioObjectReader.readUInt32(observedAggregateID, selector: kAudioDevicePropertyDeviceIsAlive)
+            guard alive != 1 else { return }
+            self.handleRouteChange(reason: "aggregate device liveness changed")
         }
 
         var aggregateAliveAddress = AudioObjectPropertyAddress(
@@ -641,6 +719,61 @@ final class SystemTapCapture {
     private func unregisterRouteChangeListeners() {
         unregisterDefaultOutputListener()
         unregisterAggregateAliveListener()
+        unregisterFormatListeners()
+    }
+
+    private func registerFormatListeners(graph: SystemTapGraph) throws {
+        // Bluetooth changes call mode without changing the default device ID. Watch
+        // both the capture stream and its clock; ignore unchanged notifications from
+        // our own graph setup so rebuilding cannot trigger an endless rebuild loop.
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self, self.isRunning, self.aggregateID == graph.aggregateID else { return }
+            do {
+                let outputRate = try self.readOutputSampleRate(streamID: graph.outputStreamID)
+                if outputRate != graph.sourceFormat.sampleRate {
+                    DebugDiagnostics.log(
+                        recordingFolder: self.recordingFolder,
+                        "system output clock changed oldRate=\(graph.sourceFormat.sampleRate) newRate=\(outputRate)"
+                    )
+                    self.handleRouteChange(reason: "output sample rate changed")
+                    return
+                }
+                let input = try self.readAggregateInputFormat(aggregateID: graph.aggregateID)
+                guard input.streamID != graph.inputStreamID || !input.format.isEquivalent(to: graph.sourceFormat) else { return }
+                DebugDiagnostics.log(
+                    recordingFolder: self.recordingFolder,
+                    "system capture format changed oldRate=\(graph.sourceFormat.sampleRate) newRate=\(input.format.sampleRate)"
+                )
+                self.handleRouteChange(reason: "capture format changed")
+            } catch {
+                self.handleRouteChange(reason: "capture format unavailable: \(error)")
+            }
+        }
+        let properties: [(AudioObjectID, AudioObjectPropertySelector, AudioObjectPropertyScope)] = [
+            (graph.tapID, kAudioTapPropertyFormat, kAudioObjectPropertyScopeGlobal),
+            (graph.aggregateID, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal),
+            (graph.aggregateID, kAudioDevicePropertyStreams, kAudioDevicePropertyScopeInput),
+            (graph.inputStreamID, kAudioStreamPropertyVirtualFormat, kAudioObjectPropertyScopeGlobal),
+            (graph.outputDeviceID, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal),
+            (graph.outputDeviceID, kAudioDevicePropertyStreams, kAudioDevicePropertyScopeOutput),
+            (graph.outputStreamID, kAudioStreamPropertyVirtualFormat, kAudioObjectPropertyScopeGlobal)
+        ]
+        for (objectID, selector, scope) in properties {
+            var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+            try CaptureError.check(
+                AudioObjectAddPropertyListenerBlock(objectID, &address, listenerQueue, listener),
+                "AudioObjectAddPropertyListenerBlock(capture format)"
+            )
+            formatListeners.append((objectID, address, listener))
+        }
+    }
+
+    private func unregisterFormatListeners() {
+        for entry in formatListeners {
+            var address = entry.address
+            AudioObjectRemovePropertyListenerBlock(entry.objectID, &address, listenerQueue, entry.block)
+        }
+        formatListeners.removeAll()
     }
 
     private func unregisterDefaultOutputListener() {
@@ -764,11 +897,13 @@ final class SystemTapCapture {
         writer.drainBacklogBeforeRouteRebuild()
 
         unregisterAggregateAliveListener()
+        unregisterFormatListeners()
         destroyTapGraph()
         installTapGraph(newGraph)
 
         try writer.reconfigure(sourceFormat: newGraph.sourceFormat)
         try registerAggregateAliveListener()
+        try registerFormatListeners(graph: newGraph)
         try createIOProc(timeout: timeout)
         try startDevice(timeout: timeout)
         DebugDiagnostics.log(

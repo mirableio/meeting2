@@ -79,6 +79,16 @@ final class TrackWriter {
 
         queue.sync {
             drainAll()
+            do {
+                try flushConverter()
+            } catch {
+                DebugDiagnostics.log(recordingFile: url, "\(url.lastPathComponent) converter flush failed error=\(error)")
+                fputs("TrackWriter converter flush failed: \(error)\n", stderr)
+            }
+            if #available(macOS 15.0, *) {
+                // Publish the final CAF frame count before recovery/compression reads it.
+                file.close()
+            }
             let snapshot = meter.snapshot
             DebugDiagnostics.log(
                 recordingFile: url,
@@ -100,6 +110,7 @@ final class TrackWriter {
             // the old converter first, then swap the source format so one CAF file
             // remains continuous without mislabeling pre-change frames.
             drainAll()
+            try flushConverter()
             try configureSourceFormat(newSourceFormat)
         }
     }
@@ -252,6 +263,33 @@ final class TrackWriter {
             "\(url.lastPathComponent) writer configured converter sourceRate=\(newSourceFormat.sampleRate) " +
             "outputRate=\(outputFormat.sampleRate)"
         )
+    }
+
+    private func flushConverter() throws {
+        guard let converter else { return }
+        // A resampler retains a short look-ahead tail. At stop or a format switch,
+        // mark the old stream ended so those samples are written before its converter
+        // is released. Ordinary timer drains use noDataNow and keep that state alive.
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 4096) else {
+            throw CaptureError.conversionFailed("Could not allocate converter flush buffer")
+        }
+        while true {
+            var error: NSError?
+            let status = converter.convert(to: buffer, error: &error) { _, inputStatus in
+                inputStatus.pointee = .endOfStream
+                return nil
+            }
+            if let error { throw error }
+            if status == .error {
+                throw CaptureError.conversionFailed("Could not flush track converter")
+            }
+            if buffer.frameLength > 0 {
+                try file.write(from: buffer)
+                meter.ingest(buffer)
+                logWrittenBuffer(buffer)
+            }
+            if status == .endOfStream || buffer.frameLength == 0 { return }
+        }
     }
 
     private func validateSourceFormat(_ format: AVAudioFormat) throws {
