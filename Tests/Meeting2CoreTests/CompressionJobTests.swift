@@ -115,7 +115,10 @@ final class CompressionJobTests: XCTestCase {
         // channel leaked into the combined file.
         try writeCAF(folder.appendingPathComponent("mic.caf"), divisor: 24)
         try writeCAF(folder.appendingPathComponent("system.caf"), divisor: 7)
-        _ = try await store.finalizeCompletedRecording(folder: folder, stats: nil)
+        var metadata = try await store.finalizeCompletedRecording(folder: folder, stats: nil)
+        metadata.tracks.mic.routeChanges = 0
+        metadata.tracks.system.routeChanges = 0
+        try AtomicJSON.write(metadata, to: MeetingStore.metadataURL(in: folder))
 
         let result = try await job.perform(folder: folder, store: store)
         XCTAssertEqual(result.status, .compressed)
@@ -142,6 +145,8 @@ final class CompressionJobTests: XCTestCase {
         try writeCAF(folder.appendingPathComponent("mic.caf"), frameCount: 9_600)
         try writeCAF(folder.appendingPathComponent("system.caf"), divisor: 7, frameCount: 48_000)
         var metadata = try await store.finalizeCompletedRecording(folder: folder, stats: nil)
+        metadata.tracks.mic.routeChanges = 0
+        metadata.tracks.system.routeChanges = 0
         metadata.tracks.system.rms = 0.7
         metadata.audioHealth.systemSilent = false
         try AtomicJSON.write(metadata, to: MeetingStore.metadataURL(in: folder))
@@ -174,6 +179,8 @@ final class CompressionJobTests: XCTestCase {
         try writeCAF(folder.appendingPathComponent("mic.caf"), frameCount: 9_600)
         try writeCAF(folder.appendingPathComponent("system.caf"), frameCount: 48_000, amplitude: 0)
         var metadata = try await store.finalizeCompletedRecording(folder: folder, stats: nil)
+        metadata.tracks.mic.routeChanges = 0
+        metadata.tracks.system.routeChanges = 0
         metadata.audioHealth.systemSilent = true
         try AtomicJSON.write(metadata, to: MeetingStore.metadataURL(in: folder))
 
@@ -187,7 +194,7 @@ final class CompressionJobTests: XCTestCase {
     }
 
     func testLoudspeakerWithUnknownSystemLevelKeepsSurvivingMic() async throws {
-        let folder = root.appendingPathComponent("2026-06-09 15-02-00 — Recovered")
+        let folder = root.appendingPathComponent("2026-06-09 15-02-00 — Unknown system level")
         let store = MeetingStore(root: root)
         _ = try await store.markRecordingStarted(
             folder: folder,
@@ -196,7 +203,10 @@ final class CompressionJobTests: XCTestCase {
         )
         try writeCAF(folder.appendingPathComponent("mic.caf"), frameCount: 9_600)
         try writeCAF(folder.appendingPathComponent("system.caf"), divisor: 7, frameCount: 48_000)
-        _ = try await store.finalizeCompletedRecording(folder: folder, stats: nil)
+        var metadata = try await store.finalizeCompletedRecording(folder: folder, stats: nil)
+        metadata.tracks.mic.routeChanges = 0
+        metadata.tracks.system.routeChanges = 0
+        try AtomicJSON.write(metadata, to: MeetingStore.metadataURL(in: folder))
 
         _ = try await CompressionJob().perform(folder: folder, store: store)
 
@@ -216,6 +226,8 @@ final class CompressionJobTests: XCTestCase {
         try writeCAF(folder.appendingPathComponent("mic.caf"), frameCount: 9_600)
         try writeCAF(folder.appendingPathComponent("system.caf"), divisor: 7, frameCount: 48_000, activeFrames: 5)
         var metadata = try await store.finalizeCompletedRecording(folder: folder, stats: nil)
+        metadata.tracks.mic.routeChanges = 0
+        metadata.tracks.system.routeChanges = 0
         metadata.tracks.system.rms = 0.0035
         metadata.tracks.system.peak = 0.54
         metadata.audioHealth.systemSilent = false
@@ -226,6 +238,78 @@ final class CompressionJobTests: XCTestCase {
         let (left, _) = try decodeStereo(folder.appendingPathComponent("audio.m4a"))
         XCTAssertLessThan(left.count, 20_000)
         XCTAssertGreaterThan(left.map(abs).max() ?? 0, 0.5)
+    }
+
+    func testChangedRoutesKeepBothTracksRegardlessOfStartingRoute() async throws {
+        // Returning to speakers does not undo the headphone interval. The persisted
+        // counters, not the final device, must prevent discarding the remote voice.
+        let cases: [(name: String, loudspeaker: Bool, micChanges: Int, systemChanges: Int)] = [
+            ("speakers-to-headphones", true, 0, 1),
+            ("speakers-to-headphones-and-back", true, 0, 2),
+            ("headphones-to-speakers", false, 0, 1),
+            ("headphones-to-speakers-and-back", false, 0, 2),
+            ("input-changed", true, 1, 0)
+        ]
+        let store = MeetingStore(root: root)
+        for test in cases {
+            let folder = root.appendingPathComponent(test.name)
+            _ = try await store.markRecordingStarted(
+                folder: folder,
+                startedAt: Date(timeIntervalSince1970: 0),
+                outputRoute: OutputRoute(isLoudspeaker: test.loudspeaker)
+            )
+            try writeCAF(folder.appendingPathComponent("mic.caf"), divisor: 24)
+            try writeCAF(folder.appendingPathComponent("system.caf"), divisor: 7, frameCount: 19_200)
+            let stats = RecordingStats(
+                mic: TrackStats(
+                    url: folder.appendingPathComponent("mic.caf"), rms: 0.7, peak: 1,
+                    droppedBytes: 0, routeChanges: test.micChanges
+                ),
+                system: TrackStats(
+                    url: folder.appendingPathComponent("system.caf"), rms: 0.7, peak: 1,
+                    droppedBytes: 0, routeChanges: test.systemChanges
+                )
+            )
+            _ = try await store.finalizeCompletedRecording(folder: folder, stats: stats)
+
+            _ = try await CompressionJob().perform(folder: folder, store: store)
+
+            let (left, right) = try decodeStereo(folder.appendingPathComponent("audio.m4a"))
+            XCTAssertGreaterThanOrEqual(right.count, 19_200, test.name)
+            XCTAssertGreaterThan(left.map(abs).max() ?? 0, 0.5, test.name)
+            XCTAssertGreaterThan(right.suffix(9_600).map(abs).max() ?? 0, 0.5, test.name)
+            let maxDelta = zip(left, right).map { abs($0 - $1) }.max() ?? 0
+            XCTAssertGreaterThan(maxDelta, 0.5, "\(test.name): tracks were reduced to centered mono")
+        }
+    }
+
+    func testRecoveredLoudspeakerRecordingWithUnknownRoutesKeepsBothTracks() async throws {
+        // A crash leaves the starting route but no live counters. Treating missing
+        // counters as zero would lose any headphone interval that happened before it.
+        let folder = root.appendingPathComponent("2026-10-13 12-00-00")
+        let store = MeetingStore(root: root)
+        _ = try await store.markRecordingStarted(
+            folder: folder,
+            startedAt: Date(timeIntervalSince1970: 0),
+            outputRoute: OutputRoute(isLoudspeaker: true)
+        )
+        try writeCAF(folder.appendingPathComponent("mic.caf"), divisor: 24)
+        try writeCAF(folder.appendingPathComponent("system.caf"), divisor: 7, frameCount: 19_200)
+        let recovered = try await store.recoverInterruptedRecordings()
+        XCTAssertEqual(recovered.filter(\.didRecover).count, 1)
+        let snapshot = try await store.snapshot(folder: folder)
+        let metadata = try XCTUnwrap(snapshot.metadata)
+        XCTAssertNil(metadata.tracks.mic.routeChanges)
+        XCTAssertNil(metadata.tracks.system.routeChanges)
+
+        _ = try await CompressionJob().perform(folder: folder, store: store)
+
+        let (left, right) = try decodeStereo(folder.appendingPathComponent("audio.m4a"))
+        XCTAssertGreaterThanOrEqual(right.count, 19_200)
+        XCTAssertGreaterThan(left.map(abs).max() ?? 0, 0.5)
+        XCTAssertGreaterThan(right.suffix(9_600).map(abs).max() ?? 0, 0.5)
+        let maxDelta = zip(left, right).map { abs($0 - $1) }.max() ?? 0
+        XCTAssertGreaterThan(maxDelta, 0.5)
     }
 
     func testRouteChangeDoesNotStretchSystemAudioAsClockDrift() async throws {

@@ -118,9 +118,12 @@ public struct CompressionJob {
         let systemOffset = metadata?.tracks.system.startOffsetSeconds ?? 0
         // File-length differences can mean missed callbacks after either route
         // changed, not clock drift. Unknown recovery stats are not proof of continuity.
-        let allowDriftCorrection = metadata?.tracks.mic.routeChanges == 0
+        let routesUnchanged = metadata?.tracks.mic.routeChanges == 0
             && metadata?.tracks.system.routeChanges == 0
 
+        // The starting speakers are not proof the mic heard the entire call. Once
+        // either route changed, keep both tracks even if the user switched back.
+        // Missing crash-recovery counters are likewise not proof of unchanged routes.
         // Speakers normally favor mic-only to avoid echo. If the mic delivered less than
         // half as much audio as the system tap, its file may contain collapsed gaps: the
         // first timestamp cannot place later samples reliably. Use the complete system
@@ -129,7 +132,7 @@ public struct CompressionJob {
         // has no RMS and one stray notification can make `systemSilent` false. Both raw
         // tracks are retained for a more informed manual recovery.
         let selection: CombinedAudioBuilder.TrackSelection
-        if metadata?.outputRoute?.isLoudspeaker == true {
+        if metadata?.outputRoute?.isLoudspeaker == true, routesUnchanged {
             let micDuration = metadata?.tracks.mic.durationSeconds ?? 0
             let systemDuration = metadata?.tracks.system.durationSeconds ?? 0
             let systemRMS = metadata?.tracks.system.rms ?? 0
@@ -162,7 +165,7 @@ public struct CompressionJob {
                 micPeak: metadata?.tracks.mic.peak,
                 systemPeak: metadata?.tracks.system.peak,
                 selection: selection,
-                allowDriftCorrection: allowDriftCorrection
+                allowDriftCorrection: routesUnchanged
             )
             try Self.validateAudioFile(temporaryURL)
             try fileManager.moveItem(at: temporaryURL, to: audioURL)

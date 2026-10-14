@@ -2,8 +2,8 @@ import CoreAudio
 import Foundation
 
 /// Where the Mac was sending audio when a recording began — captured once at start and
-/// stored in `meeting.json`. We use it to decide, after the fact, whether the microphone
-/// could *acoustically hear* the call:
+/// stored in `meeting.json`. Together with the tracks' route-change counts, it tells
+/// compression whether the microphone could *acoustically hear* the entire call:
 ///
 ///  - On the **built-in speakers** it can. The remote party's voice comes out of the
 ///    speakers and bleeds back into the mic, so the mic track alone already contains the
@@ -18,6 +18,8 @@ import Foundation
 /// count. A wrong "loudspeaker" would drop the system track and could lose the remote
 /// voice; a wrong "headphones" merely leaves a harmless echo. (And either way the raw
 /// system audio is still preserved separately as `system.m4a`.)
+/// A changed or unknown route history always keeps both tracks, even if capture began
+/// on speakers: a headphone interval would otherwise lose the remote participant.
 public struct OutputRoute: Codable, Equatable, Sendable {
     public var deviceName: String?
     /// A coarse transport label: "BuiltIn", "Bluetooth", "USB", "HDMI", "Virtual", …
