@@ -130,7 +130,7 @@ final class MicCapture {
         DebugDiagnostics.log(
             recordingFile: outputURL,
             "mic start sourceRate=\(sourceFormat.sampleRate) channels=\(sourceFormat.channelCount) " +
-            "converter=\(converter != nil)"
+            "converter=\(converter != nil) layoutTag=\(sourceFormat.channelLayout?.layoutTag ?? 0)"
         )
 
         let file = try AVAudioFile(
@@ -259,7 +259,7 @@ final class MicCapture {
         }
     }
 
-    private static func makeConverter(from format: AVAudioFormat) throws -> AVAudioConverter? {
+    static func makeConverter(from format: AVAudioFormat) throws -> AVAudioConverter? {
         // Recheck the hardware format after each route change. A tap bound to the old
         // channel count or a converter built for it cannot safely resume capture.
         guard format.sampleRate > 0, format.channelCount > 0 else {
@@ -268,6 +268,13 @@ final class MicCapture {
         if format.isEquivalent(to: AudioFormat.pcmFormat) { return nil }
         guard let converter = AVAudioConverter(from: format, to: AudioFormat.pcmFormat) else {
             throw CaptureError.conversionFailed("Could not create mic AVAudioConverter")
+        }
+        if format.channelCount > 1 {
+            // These are microphone inputs, not surround speakers. Layout-based 3-to-1
+            // remapping can select an empty center channel (or silence for a discrete
+            // layout) without an error. Preserve the first input explicitly instead
+            // of mixing raw microphone-array channels with unknown phase relationships.
+            converter.channelMap = [0]
         }
         return converter
     }

@@ -193,6 +193,36 @@ final class CompressionJobTests: XCTestCase {
         XCTAssertGreaterThan(peak, 0.5)
     }
 
+    func testFullLengthSilentMicFallsBackToSystemIncludingQuietAudio() async throws {
+        // A zero-filled mic has a healthy duration. Duration alone cannot justify
+        // discarding the only captured speech, even below the short-mic RMS floor.
+        let store = MeetingStore(root: root)
+        for amplitude: Float in [0.7, 0.003] {
+            let folder = root.appendingPathComponent("silent-mic-\(amplitude)")
+            _ = try await store.markRecordingStarted(
+                folder: folder,
+                startedAt: Date(timeIntervalSince1970: 0),
+                outputRoute: OutputRoute(isLoudspeaker: true)
+            )
+            let mic = folder.appendingPathComponent("mic.caf")
+            let system = folder.appendingPathComponent("system.caf")
+            try writeCAF(mic, amplitude: 0)
+            try writeCAF(system, amplitude: amplitude)
+            let stats = RecordingStats(
+                mic: TrackStats(url: mic, rms: 0, peak: 0, droppedBytes: 0),
+                system: TrackStats(url: system, rms: Double(amplitude) / sqrt(2), peak: amplitude, droppedBytes: 0)
+            )
+            _ = try await store.finalizeCompletedRecording(folder: folder, stats: stats)
+
+            _ = try await CompressionJob().perform(folder: folder, store: store)
+
+            let (left, right) = try decodeStereo(folder.appendingPathComponent("audio.m4a"))
+            XCTAssertGreaterThan(left.map(abs).max() ?? 0, amplitude / 2)
+            XCTAssertGreaterThan(right.map(abs).max() ?? 0, amplitude / 2)
+            XCTAssertLessThan(zip(left, right).map { abs($0 - $1) }.max() ?? 0, 0.01)
+        }
+    }
+
     func testLoudspeakerWithUnknownSystemLevelKeepsSurvivingMic() async throws {
         let folder = root.appendingPathComponent("2026-06-09 15-02-00 — Unknown system level")
         let store = MeetingStore(root: root)

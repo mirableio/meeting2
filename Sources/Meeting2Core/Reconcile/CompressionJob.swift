@@ -21,7 +21,7 @@ public struct MeetingCompressionResult: Equatable {
 public struct CompressionJob {
     // This is a conservative fallback, not speech detection: a notification peak can
     // make `systemSilent` false even when almost the entire track is empty.
-    private static let minimumSystemRMSForFallback = 0.005
+    private static let minimumSystemRMSForIncompleteMic = 0.005
     private let audioBuilder: CombinedAudioBuilder
 
     public init(audioBuilder: CombinedAudioBuilder = CombinedAudioBuilder()) {
@@ -124,26 +124,27 @@ public struct CompressionJob {
         // The starting speakers are not proof the mic heard the entire call. Once
         // either route changed, keep both tracks even if the user switched back.
         // Missing crash-recovery counters are likewise not proof of unchanged routes.
-        // Speakers normally favor mic-only to avoid echo. If the mic delivered less than
-        // half as much audio as the system tap, its file may contain collapsed gaps: the
-        // first timestamp cannot place later samples reliably. Use the complete system
-        // track alone rather than truncate the meeting or mix voices out of order. Never
-        // make that switch without a meaningful measured system level; crash recovery
-        // has no RMS and one stray notification can make `systemSilent` false. Both raw
+        // Speakers normally favor mic-only to avoid echo. A full-length file of zeros
+        // is not a working microphone. Also, if the mic delivered less than half as
+        // much audio as the system tap, its file may contain collapsed gaps: the
+        // first timestamp cannot place later samples reliably. For a short but non-silent
+        // mic, require a meaningful system level: a stray notification must not displace
+        // surviving local speech. For a known-silent mic there is no speech to displace,
+        // so even a quiet, known-non-silent system track is a better source. Both raw
         // tracks are retained for a more informed manual recovery.
         let selection: CombinedAudioBuilder.TrackSelection
         if metadata?.outputRoute?.isLoudspeaker == true, routesUnchanged {
             let micDuration = metadata?.tracks.mic.durationSeconds ?? 0
             let systemDuration = metadata?.tracks.system.durationSeconds ?? 0
             let systemRMS = metadata?.tracks.system.rms ?? 0
+            let micSilent = metadata?.audioHealth.micSilent == true
             if systemDuration > 0,
-               metadata?.audioHealth.systemSilent != true,
-               systemRMS >= Self.minimumSystemRMSForFallback,
-               micDuration < systemDuration * 0.5 {
+               metadata?.audioHealth.systemSilent == false,
+               micSilent || (systemRMS >= Self.minimumSystemRMSForIncompleteMic && micDuration < systemDuration * 0.5) {
                 selection = .systemOnly
                 DebugDiagnostics.log(
                     recordingFolder: micCAF.deletingLastPathComponent(),
-                    "incomplete mic: system-only audio micSeconds=\(micDuration) " +
+                    "\(micSilent ? "silent" : "incomplete") mic: system-only audio micSeconds=\(micDuration) " +
                     "systemSeconds=\(systemDuration) systemRMS=\(systemRMS)"
                 )
             } else {

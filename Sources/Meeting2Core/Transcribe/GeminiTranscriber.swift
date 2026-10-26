@@ -88,12 +88,14 @@ public struct GeminiTranscriber: Transcriber {
             struct Content: Decodable {
                 struct Part: Decodable {
                     let text: String?
+                    let thought: Bool?
                 }
 
                 let parts: [Part]?
             }
 
             let content: Content?
+            let finishReason: String?
         }
 
         struct APIError: Decodable {
@@ -104,6 +106,12 @@ public struct GeminiTranscriber: Transcriber {
 
         let candidates: [Candidate]?
         let error: APIError?
+        struct Usage: Decodable {
+            let promptTokenCount: Int?
+            let candidatesTokenCount: Int?
+            let thoughtsTokenCount: Int?
+        }
+        let usageMetadata: Usage?
     }
 
     private struct GenerateRequest: Encodable {
@@ -132,7 +140,12 @@ public struct GeminiTranscriber: Transcriber {
         }
 
         struct GenerationConfig: Encodable {
+            struct ThinkingConfig: Encodable {
+                let thinkingBudget: Int
+            }
             let temperature: Double
+            let maxOutputTokens: Int?
+            let thinkingConfig: ThinkingConfig?
         }
 
         let contents: [Content]
@@ -169,18 +182,16 @@ public struct GeminiTranscriber: Transcriber {
 
     public func transcribe(audioFile: URL, hints: TranscriptionHints) async throws -> Transcript {
         let uploadedFile = try await upload(audioFile: audioFile, displayName: "\(hints.meetingID)-transcript.m4a")
-        defer {
-            Task {
-                try? await deleteRemoteFile(named: uploadedFile.name)
-            }
+        do {
+            let rawText = try await generateTranscript(file: uploadedFile, audioFile: audioFile)
+            // Await cleanup before returning: the development CLI can exit as soon as
+            // this method finishes, which would abandon an unstructured deletion task.
+            try? await deleteRemoteFile(named: uploadedFile.name)
+            return Transcript(provider: id, model: model, text: rawText)
+        } catch {
+            try? await deleteRemoteFile(named: uploadedFile.name)
+            throw error
         }
-
-        let rawText = try await generateTranscript(file: uploadedFile)
-        guard !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw CaptureError.invalidState("Gemini returned an empty transcript")
-        }
-
-        return Transcript(provider: id, model: model, text: rawText)
     }
 
     private func upload(audioFile: URL, displayName: String) async throws -> GeminiFile {
@@ -188,6 +199,7 @@ public struct GeminiTranscriber: Transcriber {
         guard fileSize > 0 else {
             throw CaptureError.invalidState("Transcript audio file is empty: \(audioFile.path)")
         }
+        DebugDiagnostics.log(recordingFile: audioFile, "Gemini upload started bytes=\(fileSize)")
 
         let uploadURL = try await startUpload(
             displayName: displayName,
@@ -199,6 +211,7 @@ public struct GeminiTranscriber: Transcriber {
         guard let file = response.file, !file.uri.isEmpty else {
             throw CaptureError.invalidState("Gemini file upload did not return a usable file URI")
         }
+        DebugDiagnostics.log(recordingFile: audioFile, "Gemini upload finished")
         return file
     }
 
@@ -238,7 +251,7 @@ public struct GeminiTranscriber: Transcriber {
         return data
     }
 
-    private func generateTranscript(file: GeminiFile) async throws -> String {
+    private func generateTranscript(file: GeminiFile, audioFile: URL) async throws -> String {
         let url = URL(
             string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent"
         )!
@@ -257,12 +270,34 @@ public struct GeminiTranscriber: Transcriber {
                     )
                 ])
             ],
-            generationConfig: .init(temperature: 1.0)
+            // Reserve the documented Gemini 3 Flash output budget for long meetings;
+            // still reject MAX_TOKENS below rather than save a plausible fragment as done.
+            generationConfig: .init(
+                temperature: 1.0,
+                maxOutputTokens: model == Configuration.defaultModel ? 65_536 : nil,
+                // High and medium both exhausted the shared output budget on a real
+                // 95-minute call (62,910 / 49,281 thinking tokens). Request a numeric
+                // budget instead of a relative level, leaving room for the transcript.
+                // The provider can overshoot this target; STOP validation still matters.
+                thinkingConfig: model == Configuration.defaultModel ? .init(thinkingBudget: 8_192) : nil
+            )
         )
         request.httpBody = try MeetingJSON.encoder.encode(body)
 
+        DebugDiagnostics.log(
+            recordingFile: audioFile,
+            "Gemini generation started model=\(model) " +
+            "maxOutputTokens=\(body.generationConfig.maxOutputTokens ?? -1) " +
+            "thinkingBudget=\(body.generationConfig.thinkingConfig?.thinkingBudget ?? -1)"
+        )
         let (data, response) = try await session.data(for: request)
         _ = try Self.checkedHTTPResponse(response, operation: "Gemini generateContent", body: data)
+        return try Self.transcriptText(from: data, recordingFile: audioFile)
+    }
+
+    // Keep provider completion validation at the HTTP boundary. A nonempty response
+    // can still be truncated or blocked; the job must remain failed/retryable then.
+    static func transcriptText(from data: Data, recordingFile: URL? = nil) throws -> String {
         let decoded = try MeetingJSON.decoder.decode(GenerateResponse.self, from: data)
         if let error = decoded.error {
             throw CaptureError.invalidState(
@@ -271,10 +306,25 @@ public struct GeminiTranscriber: Transcriber {
             )
         }
 
-        let text = decoded.candidates?
-            .flatMap { $0.content?.parts ?? [] }
+        let candidate = decoded.candidates?.first
+        let reason = candidate?.finishReason ?? "missing"
+        let usage = decoded.usageMetadata
+        let completion = "finishReason=\(reason) inputTokens=\(usage?.promptTokenCount ?? -1) " +
+            "outputTokens=\(usage?.candidatesTokenCount ?? -1) thinkingTokens=\(usage?.thoughtsTokenCount ?? -1)"
+        DebugDiagnostics.log(recordingFolder: recordingFile?.deletingLastPathComponent(), "Gemini completion \(completion)")
+        guard reason == "STOP" else {
+            throw CaptureError.invalidState("Gemini did not complete transcription: \(completion)")
+        }
+
+        // Candidates are alternatives, not consecutive transcript sections. Thought
+        // summaries are diagnostics, not the speaker text the user asked to save.
+        let text = (candidate?.content?.parts ?? [])
+            .filter { $0.thought != true }
             .compactMap(\.text)
-            .joined(separator: "\n") ?? ""
+            .joined(separator: "\n")
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CaptureError.invalidState("Gemini returned an empty transcript")
+        }
         return text
     }
 

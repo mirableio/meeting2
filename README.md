@@ -141,6 +141,8 @@ That's it. From now on, **each time you stop a recording it's transcribed automa
 
 The transcript marks who's speaking (your mic vs. the call), in the language spoken, without timestamps. If you don't set a key, recording and saving still work perfectly — transcription is simply skipped.
 
+The default `gemini-3-flash-preview` request keeps temperature at 1, allows up to 65,536 output tokens, and requests an 8,192-token reasoning budget. The provider can exceed that target. Relative high and medium reasoning levels exhausted the shared reasoning/answer budget on a real 95-minute call, leaving an incomplete transcript. Only a nonempty response ending with `STOP` is saved as successful; token-limited or blocked responses remain failed and retryable. Debug logs retain upload/generation phases, completion reasons, and token counts, not internal reasoning. These checks catch provider-reported truncation, not omissions or translation mistakes in an otherwise completed response. See Google's [model limits](https://ai.google.dev/gemini-api/docs/models/gemini-3-flash-preview), [thinking controls](https://ai.google.dev/gemini-api/docs/generate-content/thinking#thinking-budgets), and [completion reasons](https://ai.google.dev/api/generate-content#FinishReason).
+
 *Advanced (optional):* you can override the model or prompt in the same file with `GEMINI_MODEL=...` and `GEMINI_PROMPT=...`.
 
 ---
